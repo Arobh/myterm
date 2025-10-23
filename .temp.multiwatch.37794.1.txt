@@ -1,5 +1,0 @@
-USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
-root           1  0.0  0.0  23852 14408 ?        Ss   Oct23   0:11 /sbin/init splash
-root           2  0.0  0.0      0     0 ?        S    Oct23   0:00 [kthreadd]
-root           3  0.0  0.0      0     0 ?        S    Oct23   0:00 [pool_workqueue_release]
-root           4  0.0  0.0      0     0 ?        I<   Oct23   0:00 [kworker/R-rcu_gp]
