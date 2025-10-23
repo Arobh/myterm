@@ -8,6 +8,8 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #define BUFFER_ROWS 25
 #define BUFFER_COLS 80
@@ -22,6 +24,118 @@ char current_command[MAX_COMMAND_LENGTH];
 int command_length = 0;
 int cursor_row = 1;
 int cursor_col = 0;
+int cursor_buffer_pos = 0; // Cursor position in command buffer
+pid_t foreground_pid = -1;
+volatile sig_atomic_t signal_received = 0;
+volatile sig_atomic_t which_signal = 0;
+
+#define MAX_HISTORY_SIZE 10000
+char command_history[MAX_HISTORY_SIZE][MAX_COMMAND_LENGTH];
+int history_count = 0;
+int history_current = -1;
+int search_mode = 0;
+char search_buffer[MAX_COMMAND_LENGTH] = {0};
+int search_pos = 0;
+
+// Function to add a command to history
+void add_to_history(const char *command)
+{
+    // Skip empty commands and duplicates of last command
+    if (strlen(command) == 0 ||
+        (history_count > 0 && strcmp(command_history[history_count - 1], command) == 0))
+    {
+        return;
+    }
+
+    if (history_count < MAX_HISTORY_SIZE)
+    {
+        strncpy(command_history[history_count], command, MAX_COMMAND_LENGTH - 1);
+        command_history[history_count][MAX_COMMAND_LENGTH - 1] = '\0';
+        history_count++;
+    }
+    else
+    {
+        // Shift history down (remove oldest)
+        for (int i = 1; i < MAX_HISTORY_SIZE; i++)
+        {
+            strcpy(command_history[i - 1], command_history[i]);
+        }
+        strncpy(command_history[MAX_HISTORY_SIZE - 1], command, MAX_COMMAND_LENGTH - 1);
+        command_history[MAX_HISTORY_SIZE - 1][MAX_COMMAND_LENGTH - 1] = '\0';
+    }
+    history_current = history_count;
+}
+
+// Function to handle history built-in command
+void handle_history_command()
+{
+    int start = (history_count > 10) ? history_count - 10 : 0;
+    for (int i = start; i < history_count; i++)
+    {
+        char history_line[256];
+        snprintf(history_line, sizeof(history_line), "%d: %s", i + 1, command_history[i]);
+        add_text_to_buffer(history_line);
+    }
+}
+
+// Function to search history
+int search_history(const char *search_term, char *result)
+{
+    // Search from most recent to oldest
+    for (int i = history_count - 1; i >= 0; i--)
+    {
+        if (strstr(command_history[i], search_term) != NULL)
+        {
+            strcpy(result, command_history[i]);
+            return 1;
+        }
+    }
+    return 0; // Not found
+}
+
+// Function to enter search mode
+void enter_search_mode()
+{
+    search_mode = 1;
+    search_pos = 0;
+    search_buffer[0] = '\0';
+
+    // Clear current command and show search prompt
+    memset(current_command, 0, MAX_COMMAND_LENGTH);
+    command_length = 0;
+    cursor_buffer_pos = 0;
+
+    // Update display to show search prompt
+    update_command_display_with_prompt("(reverse-i-search)`': ");
+}
+
+// Function to update display with custom prompt
+void update_command_display_with_prompt(const char *prompt)
+{
+    // Clear the current command line in text buffer
+    for (int col = 0; col < BUFFER_COLS; col++)
+    {
+        text_buffer[cursor_row][col] = ' ';
+    }
+
+    // Write the custom prompt
+    int prompt_len = strlen(prompt);
+    for (int i = 0; i < prompt_len && i < BUFFER_COLS; i++)
+    {
+        text_buffer[cursor_row][i] = prompt[i];
+    }
+
+    // Write the search buffer
+    int display_col = prompt_len;
+    for (int i = 0; i < search_pos && display_col < BUFFER_COLS; i++)
+    {
+        text_buffer[cursor_row][display_col] = search_buffer[i];
+        display_col++;
+    }
+
+    // Update the visual cursor position
+    cursor_col = prompt_len + search_pos;
+}
 
 // Function to scroll the entire buffer up by one line
 void scroll_buffer()
@@ -48,6 +162,7 @@ void scroll_buffer()
 // Function to initialize the text buffer with some content
 void initialize_text_buffer()
 {
+    cursor_buffer_pos = 0; // Start at beginning of line
     // Clear the buffer with spaces
     for (int row = 0; row < BUFFER_ROWS; row++)
     {
@@ -169,157 +284,303 @@ void add_text_to_buffer(const char *text)
 }
 
 // Function to execute a command and capture its output
-void execute_command(Display *display, Window window, GC gc, const char *command) {
+void execute_command(Display *display, Window window, GC gc, const char *command)
+{
     // Skip empty commands
-    if (command == NULL || strlen(command) == 0) {
+    if (command == NULL || strlen(command) == 0)
+    {
         add_text_to_buffer("");
         return;
+    }
+
+    // Check for built-in cd command
+    char command_copy[MAX_COMMAND_LENGTH];
+    strncpy(command_copy, command, sizeof(command_copy) - 1);
+    command_copy[sizeof(command_copy) - 1] = '\0';
+
+    // Parse the command to check if it's cd
+    char *args[64];
+    int arg_count = 0;
+    char *token = strtok(command_copy, " ");
+    while (token != NULL && arg_count < 63)
+    {
+        args[arg_count++] = token;
+        token = strtok(NULL, " ");
+    }
+    args[arg_count] = NULL;
+
+    // Handle built-in cd command (no forking)
+    if (arg_count > 0 && strcmp(args[0], "cd") == 0)
+    {
+        char *path = ".";
+        if (arg_count > 1)
+        {
+            path = args[1];
+        }
+
+        if (chdir(path) == -1)
+        {
+            char error_msg[256];
+            snprintf(error_msg, sizeof(error_msg), "cd: %s: No such file or directory", path);
+            add_text_to_buffer(error_msg);
+        }
+        else
+        {
+            // Optional: Show new directory
+            char cwd[1024];
+            if (getcwd(cwd, sizeof(cwd)) != NULL)
+            {
+                char success_msg[256];
+                snprintf(success_msg, sizeof(success_msg), "Changed to directory: %s", cwd);
+                add_text_to_buffer(success_msg);
+            }
+            else
+            {
+                add_text_to_buffer("Changed directory");
+            }
+        }
+        handle_history_command();
+        return; // Important: Return without forking
     }
 
     // Check if this is a piped command
     int num_commands = 1;
     char *commands[16]; // Max 16 commands in pipeline
-    char command_copy[MAX_COMMAND_LENGTH];
-    
-    strncpy(command_copy, command, sizeof(command_copy) - 1);
-    command_copy[sizeof(command_copy) - 1] = '\0';
-    
+    char command_copy2[MAX_COMMAND_LENGTH];
+
+    strncpy(command_copy2, command, sizeof(command_copy2) - 1);
+    command_copy2[sizeof(command_copy2) - 1] = '\0';
+
     // Split commands by pipe symbol
-    commands[0] = strtok(command_copy, "|");
-    while ((commands[num_commands] = strtok(NULL, "|")) != NULL && num_commands < 15) {
+    commands[0] = strtok(command_copy2, "|");
+    while ((commands[num_commands] = strtok(NULL, "|")) != NULL && num_commands < 15)
+    {
         num_commands++;
     }
-    
+
     // If no pipes, use the original single command logic
-    if (num_commands == 1) {
+    if (num_commands == 1)
+    {
         // Single command - use existing logic with redirections
         int pipefd[2];
         pid_t pid;
-        
-        if (pipe(pipefd) == -1) {
+
+        if (pipe(pipefd) == -1)
+        {
             add_text_to_buffer("Error: Failed to create pipe");
             return;
         }
-        
+
         pid = fork();
-        
-        if (pid == -1) {
+
+        if (pid == -1)
+        {
             close(pipefd[0]);
             close(pipefd[1]);
             add_text_to_buffer("Error: Fork failed");
             return;
         }
-        else if (pid == 0) {
+        else if (pid == 0)
+        {
             // Child process for single command
+
+            // Reset signals to default so child can be killed by Ctrl+C
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+
             close(pipefd[0]);
             dup2(pipefd[1], STDOUT_FILENO);
             dup2(pipefd[1], STDERR_FILENO);
             close(pipefd[1]);
-            
+
             // Parse for redirections in single command
             char *args[64];
             int arg_count = 0;
             char *input_file = NULL;
             char *output_file = NULL;
             char cmd_copy[MAX_COMMAND_LENGTH];
-            
+
             strncpy(cmd_copy, commands[0], sizeof(cmd_copy) - 1);
             cmd_copy[sizeof(cmd_copy) - 1] = '\0';
-            
+
             char *token = strtok(cmd_copy, " ");
-            while (token != NULL && arg_count < 63) {
-                if (strcmp(token, "<") == 0) {
+            while (token != NULL && arg_count < 63)
+            {
+                if (strcmp(token, "<") == 0)
+                {
                     token = strtok(NULL, " ");
-                    if (token != NULL) input_file = token;
-                } else if (strcmp(token, ">") == 0) {
+                    if (token != NULL)
+                        input_file = token;
+                }
+                else if (strcmp(token, ">") == 0)
+                {
                     token = strtok(NULL, " ");
-                    if (token != NULL) output_file = token;
-                } else {
+                    if (token != NULL)
+                        output_file = token;
+                }
+                else
+                {
                     args[arg_count++] = token;
                 }
                 token = strtok(NULL, " ");
             }
             args[arg_count] = NULL;
-            
-            if (input_file != NULL) {
+
+            if (input_file != NULL)
+            {
                 int fd = open(input_file, O_RDONLY);
-                if (fd == -1) {
+                if (fd == -1)
+                {
                     fprintf(stderr, "Error: Cannot open input file '%s'\n", input_file);
                     exit(1);
                 }
                 dup2(fd, STDIN_FILENO);
                 close(fd);
             }
-            
-            if (output_file != NULL) {
+
+            if (output_file != NULL)
+            {
                 int fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd == -1) {
+                if (fd == -1)
+                {
                     fprintf(stderr, "Error: Cannot create output file '%s'\n", output_file);
                     exit(1);
                 }
                 dup2(fd, STDOUT_FILENO);
                 close(fd);
             }
-            
+
             execvp(args[0], args);
             fprintf(stderr, "Error: Command not found: %s\n", args[0]);
             exit(1);
         }
-        else {
+        else
+        {
             // Parent process for single command
+            foreground_pid = pid; // Set as foreground process
+
             int status;
             char buffer[1024];
             ssize_t bytes_read;
             char full_output[OUTPUT_BUFFER_SIZE] = {0};
-            
+
             close(pipefd[1]);
             fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
-            
+
             int child_exited = 0;
-            while (!child_exited) {
+            while (!child_exited)
+            {
+                // Check for X events and signals while waiting
+                if (XPending(display) > 0)
+                {
+                    XEvent ev;
+                    XNextEvent(display, &ev);
+                    if (ev.type == KeyPress)
+                    {
+                        // Handle interrupt keys directly
+                        KeySym keysym;
+                        char keybuf[256];
+                        XLookupString(&ev.xkey, keybuf, sizeof(keybuf) - 1, &keysym, NULL);
+
+                        // Check for Ctrl+C or Ctrl+Z
+                        if ((ev.xkey.state & ControlMask) && keysym == XK_c)
+                        {
+                            printf("\nCtrl+C detected - interrupting process\n");
+                            kill(pid, SIGINT);
+                            break;
+                        }
+                        else if ((ev.xkey.state & ControlMask) && keysym == XK_z)
+                        {
+                            printf("\nCtrl+Z detected - stopping process\n");
+                            kill(pid, SIGTSTP);
+                            break;
+                        }
+                    }
+                }
+
+                // Check for signals
+                if (signal_received)
+                {
+                    signal_received = 0;
+                    if (which_signal == SIGINT)
+                    {
+                        printf("\nCtrl+C received - interrupting process\n");
+                        kill(pid, SIGINT);
+                        break;
+                    }
+                    else if (which_signal == SIGTSTP)
+                    {
+                        printf("\nCtrl+Z received - stopping process\n");
+                        kill(pid, SIGTSTP);
+                        break;
+                    }
+                    which_signal = 0;
+                }
+
+                // Try to read from pipe
                 bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1);
-                if (bytes_read > 0) {
+                if (bytes_read > 0)
+                {
                     buffer[bytes_read] = '\0';
                     strncat(full_output, buffer, OUTPUT_BUFFER_SIZE - strlen(full_output) - 1);
                 }
-                
+
+                // Check if child process has exited
                 int wait_result = waitpid(pid, &status, WNOHANG);
-                if (wait_result == pid) child_exited = 1;
-                else if (wait_result == -1) break;
-                
+                if (wait_result == pid)
+                {
+                    child_exited = 1;
+                }
+                else if (wait_result == -1)
+                {
+                    break;
+                }
+
                 usleep(10000);
             }
-            
-            while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+
+            // Read any remaining data after child exit
+            while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0)
+            {
                 buffer[bytes_read] = '\0';
                 strncat(full_output, buffer, OUTPUT_BUFFER_SIZE - strlen(full_output) - 1);
             }
-            
+
             close(pipefd[0]);
-            
-            if (strlen(full_output) > 0) {
+
+            // Reset foreground pid after command finishes
+            foreground_pid = -1;
+
+            if (strlen(full_output) > 0)
+            {
                 add_text_to_buffer(full_output);
-            } else {
+            }
+            else
+            {
                 add_text_to_buffer("");
             }
         }
     }
-    else {
+    else
+    {
         // Multiple commands with pipes
         int pipefds[2][2]; // Two sets of pipes for connecting commands
-        pid_t pids[16]; // Store child PIDs
+        pid_t pids[16];    // Store child PIDs
         int i;
         int final_output_pipe[2]; // Additional pipe to capture final output
 
         // Create pipe for final output capture
-        if (pipe(final_output_pipe) == -1) {
+        if (pipe(final_output_pipe) == -1)
+        {
             add_text_to_buffer("Error: Failed to create output pipe");
             return;
         }
 
         // Create pipes for command connections
-        for (i = 0; i < num_commands - 1; i++) {
-            if (pipe(pipefds[i % 2]) == -1) {
+        for (i = 0; i < num_commands - 1; i++)
+        {
+            if (pipe(pipefds[i % 2]) == -1)
+            {
                 add_text_to_buffer("Error: Failed to create pipe");
                 close(final_output_pipe[0]);
                 close(final_output_pipe[1]);
@@ -328,51 +589,65 @@ void execute_command(Display *display, Window window, GC gc, const char *command
         }
 
         // Fork child processes
-        for (i = 0; i < num_commands; i++) {
+        for (i = 0; i < num_commands; i++)
+        {
             pids[i] = fork();
-            
-            if (pids[i] == -1) {
+
+            if (pids[i] == -1)
+            {
                 add_text_to_buffer("Error: Fork failed");
                 return;
             }
-            else if (pids[i] == 0) {
+            else if (pids[i] == 0)
+            {
                 // Child process
-                
+
+                // Reset signals to default
+                signal(SIGINT, SIG_DFL);
+                signal(SIGTSTP, SIG_DFL);
+
                 // Connect stdin to previous pipe (if not first command)
-                if (i > 0) {
-                    dup2(pipefds[(i-1) % 2][0], STDIN_FILENO);
+                if (i > 0)
+                {
+                    dup2(pipefds[(i - 1) % 2][0], STDIN_FILENO);
                 }
-                
+
                 // Connect stdout and stderr to next pipe (if not last command)
-                if (i < num_commands - 1) {
+                if (i < num_commands - 1)
+                {
                     dup2(pipefds[i % 2][1], STDOUT_FILENO);
                     dup2(pipefds[i % 2][1], STDERR_FILENO);
-                } else {
+                }
+                else
+                {
                     // Last command - redirect both stdout and stderr to our final output pipe
                     dup2(final_output_pipe[1], STDOUT_FILENO);
                     dup2(final_output_pipe[1], STDERR_FILENO);
                 }
-                
+
                 // Close all pipe ends in child
-                for (int j = 0; j < num_commands - 1; j++) {
+                for (int j = 0; j < num_commands - 1; j++)
+                {
                     close(pipefds[j % 2][0]);
                     close(pipefds[j % 2][1]);
                 }
                 close(final_output_pipe[0]);
                 close(final_output_pipe[1]);
-                
+
                 // Parse and execute this command
                 char *args[64];
                 int arg_count = 0;
                 char cmd_copy[MAX_COMMAND_LENGTH];
-                
+
                 // Trim whitespace from command - FIXED VERSION
                 char *cmd = commands[i];
                 char *end;
-                while (*cmd == ' ') cmd++;  // Trim leading spaces
+                while (*cmd == ' ')
+                    cmd++; // Trim leading spaces
                 // Trim trailing spaces
                 end = cmd + strlen(cmd) - 1;
-                while (end > cmd && *end == ' ') {
+                while (end > cmd && *end == ' ')
+                {
                     *end = '\0';
                     end--;
                 }
@@ -381,12 +656,13 @@ void execute_command(Display *display, Window window, GC gc, const char *command
                 cmd_copy[sizeof(cmd_copy) - 1] = '\0';
 
                 char *token = strtok(cmd_copy, " ");
-                while (token != NULL && arg_count < 63) {
+                while (token != NULL && arg_count < 63)
+                {
                     args[arg_count++] = token;
                     token = strtok(NULL, " ");
                 }
                 args[arg_count] = NULL;
-                
+
                 execvp(args[0], args);
                 fprintf(stderr, "Error: Command not found: %s\n", args[0]);
                 exit(1);
@@ -394,11 +670,15 @@ void execute_command(Display *display, Window window, GC gc, const char *command
         }
 
         // Parent process - close all pipe ends we don't need
-        for (i = 0; i < num_commands - 1; i++) {
+        for (i = 0; i < num_commands - 1; i++)
+        {
             close(pipefds[i % 2][0]);
             close(pipefds[i % 2][1]);
         }
         close(final_output_pipe[1]); // Close write end of final output pipe
+
+        // Set last process as foreground for signal handling
+        foreground_pid = pids[num_commands - 1];
 
         // Read the final output from the pipe
         int status;
@@ -409,27 +689,32 @@ void execute_command(Display *display, Window window, GC gc, const char *command
         fcntl(final_output_pipe[0], F_SETFL, O_NONBLOCK);
 
         int all_children_exited = 0;
-        while (!all_children_exited) {
+        while (!all_children_exited)
+        {
             // Try to read from final output pipe
             bytes_read = read(final_output_pipe[0], buffer, sizeof(buffer) - 1);
-            if (bytes_read > 0) {
+            if (bytes_read > 0)
+            {
                 buffer[bytes_read] = '\0';
                 strncat(full_output, buffer, OUTPUT_BUFFER_SIZE - strlen(full_output) - 1);
             }
-            
+
             // Check if all children have exited
             all_children_exited = 1;
-            for (i = 0; i < num_commands; i++) {
-                if (waitpid(pids[i], &status, WNOHANG) == 0) {
+            for (i = 0; i < num_commands; i++)
+            {
+                if (waitpid(pids[i], &status, WNOHANG) == 0)
+                {
                     all_children_exited = 0; // This child is still running
                 }
             }
-            
+
             usleep(10000);
         }
 
         // Read any remaining data
-        while ((bytes_read = read(final_output_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+        while ((bytes_read = read(final_output_pipe[0], buffer, sizeof(buffer) - 1)) > 0)
+        {
             buffer[bytes_read] = '\0';
             strncat(full_output, buffer, OUTPUT_BUFFER_SIZE - strlen(full_output) - 1);
         }
@@ -437,14 +722,21 @@ void execute_command(Display *display, Window window, GC gc, const char *command
         close(final_output_pipe[0]);
 
         // Wait for all children to finish completely
-        for (i = 0; i < num_commands; i++) {
+        for (i = 0; i < num_commands; i++)
+        {
             waitpid(pids[i], NULL, 0);
         }
 
+        // Reset foreground pid after all commands finish
+        foreground_pid = -1;
+
         // Add the piped command output to our text buffer
-        if (strlen(full_output) > 0) {
+        if (strlen(full_output) > 0)
+        {
             add_text_to_buffer(full_output);
-        } else {
+        }
+        else
+        {
             add_text_to_buffer("");
         }
     }
@@ -453,6 +745,11 @@ void execute_command(Display *display, Window window, GC gc, const char *command
 // Function to handle Enter key - executes command and shows output
 void handle_enter_key(Display *display, Window window, GC gc)
 {
+    // In handle_enter_key, add this at the beginning:
+    if (strlen(current_command) > 0)
+    {
+        add_to_history(current_command);
+    }
     printf("ENTER pressed - executing command: '%s'\n", current_command);
 
     // Remove cursor from current position
@@ -506,9 +803,35 @@ void handle_enter_key(Display *display, Window window, GC gc)
     // Clear command buffer for new input
     memset(current_command, 0, MAX_COMMAND_LENGTH);
     command_length = 0;
+    cursor_buffer_pos = 0; // Reset cursor to beginning
 
     // Redraw the window
     draw_text_buffer(display, window, gc);
+}
+
+// Function to update the command display with proper cursor positioning
+void update_command_display()
+{
+    // Clear the current command line in text buffer
+    for (int col = 0; col < BUFFER_COLS; col++)
+    {
+        text_buffer[cursor_row][col] = ' ';
+    }
+
+    // Write the prompt
+    text_buffer[cursor_row][0] = '>';
+    text_buffer[cursor_row][1] = ' ';
+
+    // Write the command text
+    int display_col = 2;
+    for (int i = 0; i < command_length && display_col < BUFFER_COLS; i++)
+    {
+        text_buffer[cursor_row][display_col] = current_command[i];
+        display_col++;
+    }
+
+    // Update the visual cursor position
+    cursor_col = 2 + cursor_buffer_pos;
 }
 
 // Function to handle keyboard input
@@ -518,6 +841,7 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
     KeySym keysym;
     int buffer_len;
     int shift_pressed = (key_event->state & ShiftMask);
+    int control_pressed = (key_event->state & ControlMask);
 
     // Convert keycode to string and keysym
     buffer_len = XLookupString(key_event, buffer, sizeof(buffer) - 1, &keysym, NULL);
@@ -527,73 +851,253 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
     switch (keysym)
     {
     case XK_Escape:
-        printf("ESC pressed - exiting\n");
-        exit(0);
+        if (search_mode)
+        {
+            // Cancel search mode
+            search_mode = 0;
+            memset(current_command, 0, MAX_COMMAND_LENGTH);
+            command_length = 0;
+            cursor_buffer_pos = 0;
+            update_command_display();
+        }
+        else
+        {
+            printf("ESC pressed - exiting\n");
+            exit(0);
+        }
         break;
 
     case XK_Return:
     case XK_KP_Enter:
-        handle_enter_key(display, window, gc);
+        if (search_mode)
+        {
+            // Exit search mode and use found command
+            search_mode = 0;
+            if (search_pos > 0)
+            {
+                char found_command[MAX_COMMAND_LENGTH];
+                if (search_history(search_buffer, found_command))
+                {
+                    strcpy(current_command, found_command);
+                    command_length = strlen(current_command);
+                    cursor_buffer_pos = command_length;
+                }
+            }
+            update_command_display();
+        }
+        else
+        {
+            handle_enter_key(display, window, gc);
+        }
         break;
 
     case XK_BackSpace:
     case XK_Delete:
-        // Handle backspace
-        if (cursor_col > 2)
-        { // Don't delete the prompt
-            cursor_col--;
-            text_buffer[cursor_row][cursor_col] = ' ';
-
-            // Update command buffer
-            if (command_length > 0)
+        if (search_mode)
+        {
+            // Backspace in search mode
+            if (search_pos > 0)
             {
+                search_pos--;
+                search_buffer[search_pos] = '\0';
+                update_command_display_with_prompt("(reverse-i-search)`': ");
+            }
+        }
+        else
+        {
+            // Handle backspace - UPDATED FOR CURSOR POSITION
+            if (cursor_buffer_pos > 0)
+            {
+                // Shift all characters after cursor left by one
+                for (int i = cursor_buffer_pos - 1; i < command_length; i++)
+                {
+                    current_command[i] = current_command[i + 1];
+                }
                 command_length--;
-                current_command[command_length] = '\0';
+                cursor_buffer_pos--;
+
+                // Update text buffer display
+                update_command_display();
             }
         }
         break;
 
-    case XK_space:
-        // Handle space bar
-        if (cursor_col < BUFFER_COLS - 1)
+    case XK_Left:
+        if (!search_mode)
         {
-            text_buffer[cursor_row][cursor_col] = ' ';
-            current_command[command_length++] = ' ';
-            cursor_col++;
+            // Move cursor left
+            if (cursor_buffer_pos > 0)
+            {
+                cursor_buffer_pos--;
+                update_command_display();
+            }
         }
         break;
 
-    default:
-        // Handle printable characters
-        if (buffer_len > 0 && buffer[0] >= 32 && buffer[0] <= 126)
+    case XK_Right:
+        if (!search_mode)
         {
-            if (cursor_col < BUFFER_COLS - 1)
+            // Move cursor right
+            if (cursor_buffer_pos < command_length)
             {
-                char ch = buffer[0];
+                cursor_buffer_pos++;
+                update_command_display();
+            }
+        }
+        break;
 
-                // Update text buffer
-                text_buffer[cursor_row][cursor_col] = ch;
+    case XK_Up:
+        if (!search_mode)
+        {
+            // Navigate history backwards
+            if (history_current > 0)
+            {
+                history_current--;
+                strcpy(current_command, command_history[history_current]);
+                command_length = strlen(current_command);
+                cursor_buffer_pos = command_length;
+                update_command_display();
+            }
+        }
+        break;
 
-                // Update command buffer
+    case XK_Down:
+        if (!search_mode)
+        {
+            // Navigate history forwards
+            if (history_current < history_count - 1)
+            {
+                history_current++;
+                strcpy(current_command, command_history[history_current]);
+                command_length = strlen(current_command);
+                cursor_buffer_pos = command_length;
+            }
+            else if (history_current == history_count - 1)
+            {
+                // Clear command when at bottom
+                history_current = history_count;
+                memset(current_command, 0, MAX_COMMAND_LENGTH);
+                command_length = 0;
+                cursor_buffer_pos = 0;
+            }
+            update_command_display();
+        }
+        break;
+
+    case XK_Home:
+    case XK_a:
+        if (control_pressed && !search_mode)
+        {
+            // Ctrl+A - move to beginning of line
+            cursor_buffer_pos = 0;
+            update_command_display();
+            break;
+        }
+        // Fall through for regular 'a' key
+        goto default_case;
+
+    case XK_End:
+    case XK_e:
+        if (control_pressed && !search_mode)
+        {
+            // Ctrl+E - move to end of line
+            cursor_buffer_pos = command_length;
+            update_command_display();
+            break;
+        }
+        // Fall through for regular 'e' key
+        goto default_case;
+
+    case XK_r:
+        if (control_pressed && !search_mode)
+        {
+            // Ctrl+R - enter search mode
+            enter_search_mode();
+            break;
+        }
+        // Fall through for regular 'r' key
+        goto default_case;
+
+    case XK_space:
+        if (!search_mode)
+        {
+            // Handle space bar - UPDATED FOR CURSOR POSITION
+            if (command_length < MAX_COMMAND_LENGTH - 1)
+            {
+                // Make space for new character
+                for (int i = command_length; i > cursor_buffer_pos; i--)
+                {
+                    current_command[i] = current_command[i - 1];
+                }
+                current_command[cursor_buffer_pos] = ' ';
+                command_length++;
+                current_command[command_length] = '\0';
+                cursor_buffer_pos++;
+                update_command_display();
+            }
+        }
+        break;
+
+    default_case:
+    default:
+        if (search_mode)
+        {
+            // Handle search mode input
+            if (buffer_len > 0 && buffer[0] >= 32 && buffer[0] <= 126)
+            {
+                // Add character to search
+                if (search_pos < MAX_COMMAND_LENGTH - 1)
+                {
+                    search_buffer[search_pos] = buffer[0];
+                    search_pos++;
+                    search_buffer[search_pos] = '\0';
+                    update_command_display_with_prompt("(reverse-i-search)`': ");
+                }
+            }
+        }
+        else
+        {
+            // Handle printable characters - UPDATED FOR CURSOR POSITION
+            if (buffer_len > 0 && buffer[0] >= 32 && buffer[0] <= 126 && !control_pressed)
+            {
                 if (command_length < MAX_COMMAND_LENGTH - 1)
                 {
-                    current_command[command_length++] = ch;
+                    // Make space for new character at cursor position
+                    for (int i = command_length; i > cursor_buffer_pos; i--)
+                    {
+                        current_command[i] = current_command[i - 1];
+                    }
+                    current_command[cursor_buffer_pos] = buffer[0];
+                    command_length++;
                     current_command[command_length] = '\0';
+                    cursor_buffer_pos++;
+                    update_command_display();
+
+                    printf("Current command: '%s', cursor at: %d\n", current_command, cursor_buffer_pos);
                 }
-
-                cursor_col++;
-
-                printf("Current command: '%s'\n", current_command);
             }
         }
         break;
     }
 
-    // Redraw the window to show changes (except for Enter which handles its own redraw)
+    // Redraw the window to show changes
     if (keysym != XK_Return && keysym != XK_KP_Enter)
     {
         draw_text_buffer(display, window, gc);
     }
+}
+
+// Updated signal handlers
+void handle_sigint(int sig)
+{
+    signal_received = 1;
+    which_signal = SIGINT;
+}
+
+void handle_sigtstp(int sig)
+{
+    signal_received = 1;
+    which_signal = SIGTSTP;
 }
 
 int main()
@@ -603,6 +1107,13 @@ int main()
     XEvent event;
     int screen;
     GC gc; // Graphics Context
+
+    // Set up signal handlers - USING signal() INSTEAD OF sigaction()
+    // Handle SIGINT (Ctrl+C) - ignore in shell
+    signal(SIGINT, handle_sigint);
+
+    // Handle SIGTSTP (Ctrl+Z) - stop foreground process
+    signal(SIGTSTP, handle_sigtstp);
 
     // Initialize the text buffer
     initialize_text_buffer();
@@ -644,44 +1155,73 @@ int main()
     XMapWindow(display, window);
 
     // Set window title
-    XStoreName(display, window, "X11 Shell Terminal with Output Capture");
+    XStoreName(display, window, "X11 Shell with Signal Handling");
 
-    printf("Shell terminal with output capture created!\n");
-    printf("Try commands like: ls, pwd, echo hello, date, whoami\n");
+    printf("Shell terminal with signal handling created!\n");
+    printf("Try Ctrl+C to interrupt commands, Ctrl+Z to stop commands\n");
     printf("Press ESC to exit\n");
 
-    // 4. Main event loop
+    // 4. Main event loop - NON-BLOCKING VERSION
     while (1)
     {
-        XNextEvent(display, &event);
-
-        switch (event.type)
+        // Check if any events are pending without blocking
+        if (XPending(display) > 0)
         {
-        case Expose:
-            printf("Expose event - redrawing text buffer\n");
-            draw_text_buffer(display, window, gc);
-            break;
+            XNextEvent(display, &event);
 
-        case KeyPress:
-            handle_keypress(display, window, gc, &event.xkey);
-            break;
+            switch (event.type)
+            {
+            case Expose:
+                printf("Expose event - redrawing text buffer\n");
+                draw_text_buffer(display, window, gc);
+                break;
 
-        case ButtonPress:
-            printf("ButtonPress event received - focusing on window\n");
-            // Set focus to window for keyboard input
-            XSetInputFocus(display, window, RevertToParent, CurrentTime);
-            break;
+            case KeyPress:
+                handle_keypress(display, window, gc, &event.xkey);
+                break;
 
-        case ConfigureNotify:
-            // Window resized or moved
-            break;
+            case ButtonPress:
+                printf("ButtonPress event received - focusing on window\n");
+                XSetInputFocus(display, window, RevertToParent, CurrentTime);
+                break;
+
+            case ConfigureNotify:
+                // Window resized or moved
+                break;
+            }
         }
-    }
 
-    // Cleanup (this part won't be reached due to the infinite loop)
-    XFreeGC(display, gc);
-    XDestroyWindow(display, window);
-    XCloseDisplay(display);
+        // Check for signals
+        if (signal_received)
+        {
+            signal_received = 0;
+
+            if (which_signal == SIGINT)
+            {
+                printf("\nCtrl+C received in shell\n");
+                if (foreground_pid > 0)
+                {
+                    kill(foreground_pid, SIGINT);
+                    printf("Sent SIGINT to process %d\n", foreground_pid);
+                    foreground_pid = -1;
+                }
+            }
+            else if (which_signal == SIGTSTP)
+            {
+                printf("\nCtrl+Z received\n");
+                if (foreground_pid > 0)
+                {
+                    kill(foreground_pid, SIGSTOP);
+                    printf("Stopped process %d\n", foreground_pid);
+                    foreground_pid = -1;
+                }
+            }
+            which_signal = 0;
+        }
+
+        // Small delay to prevent busy waiting
+        usleep(10000); // 10ms
+    }
 
     return 0;
 }
