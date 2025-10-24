@@ -18,9 +18,10 @@
 #include <wchar.h>
 #include <wctype.h>
 #include <ctype.h>
+#include <execinfo.h>
+#include <sys/stat.h>
 
-#define UTF8_BUFFER_SIZE (BUFFER_COLS * 4) // UTF-8 can be up to 4 bytes per char
-
+#define UTF8_BUFFER_SIZE (BUFFER_COLS * 4)
 #define MAX_MULTIWATCH_COMMANDS 10
 #define MULTIWATCH_BUFFER_SIZE 1024
 
@@ -36,6 +37,8 @@
 #define MAX_HISTORY_SIZE 10000
 
 #define MAX_BG_JOBS 100
+
+#define SCROLLBACK_LINES 1000 // Store 1000 lines of history
 
 typedef struct
 {
@@ -79,6 +82,12 @@ typedef struct
     int search_pos;
     char tab_name[MAX_TAB_NAME];
     int active;
+
+    // SCROLLBACK BUFFER ADDITIONS
+    wchar_t scrollback_buffer[SCROLLBACK_LINES][BUFFER_COLS];
+    int scrollback_count;
+    int scrollback_offset; // How many lines we've scrolled back
+    int max_scrollback_offset;
 } Tab;
 
 Tab tabs[MAX_TABS];
@@ -98,6 +107,101 @@ void add_text_to_buffer(Tab *tab, const char *text);
 void handle_multiwatch_command(Display *display, Window window, GC gc, Tab *tab, const char *command);
 void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *tab);
 void cleanup_multiwatch();
+void render_scrollback(Tab *tab);
+void scroll_up(Tab *tab);
+void scroll_down(Tab *tab);
+void scroll_to_bottom(Tab *tab);
+void update_command_display(Tab *tab);
+
+void render_scrollback(Tab *tab)
+{
+    if (!tab)
+        return;
+
+    // Clear visible buffer
+    for (int row = 0; row < BUFFER_ROWS; row++)
+    {
+        for (int col = 0; col < BUFFER_COLS; col++)
+        {
+            tab->text_buffer[row][col] = L' ';
+        }
+    }
+
+    int total_lines = tab->scrollback_count;
+    int visible_content_lines = BUFFER_ROWS - 2; // Leave 1 line for command prompt + 1 empty line
+
+    // CORRECTED: Calculate which lines to show from scrollback
+    int start_line = total_lines - visible_content_lines - tab->scrollback_offset;
+
+    if (start_line < 0)
+        start_line = 0;
+    if (start_line > total_lines - visible_content_lines)
+    {
+        start_line = total_lines - visible_content_lines;
+    }
+    if (start_line < 0)
+        start_line = 0;
+
+    // Copy from scrollback buffer to visible buffer (top rows)
+    for (int row = 0; row < visible_content_lines; row++)
+    {
+        int scrollback_line = start_line + row;
+        if (scrollback_line >= 0 && scrollback_line < total_lines)
+        {
+            for (int col = 0; col < BUFFER_COLS; col++)
+            {
+                tab->text_buffer[row][col] = tab->scrollback_buffer[scrollback_line][col];
+            }
+        }
+    }
+
+    // ALWAYS show command prompt at BUFFER_ROWS-2 (leaving empty line at bottom)
+    tab->cursor_row = BUFFER_ROWS - 2;
+    update_command_display(tab);
+}
+
+void scroll_up(Tab *tab)
+{
+    if (tab->scrollback_count <= BUFFER_ROWS - 2)
+    {
+        return; // Not enough content to scroll
+    }
+
+    int max_offset = tab->scrollback_count - (BUFFER_ROWS - 2);
+    if (max_offset < 0)
+        max_offset = 0;
+
+    if (tab->scrollback_offset < max_offset)
+    {
+        tab->scrollback_offset++;
+        if (tab->scrollback_offset > tab->max_scrollback_offset)
+        {
+            tab->max_scrollback_offset = tab->scrollback_offset;
+        }
+        render_scrollback(tab);
+    }
+}
+
+void scroll_down(Tab *tab)
+{
+    if (tab->scrollback_offset > 0)
+    {
+        tab->scrollback_offset--;
+        render_scrollback(tab);
+    }
+    else
+    {
+        // At bottom - reset to normal view
+        tab->scrollback_offset = 0;
+        render_scrollback(tab);
+    }
+}
+
+void scroll_to_bottom(Tab *tab)
+{
+    tab->scrollback_offset = 0;
+    render_scrollback(tab);
+}
 
 // Default cleanup if main doesn't run properly
 void cleanup_resources_default(void)
@@ -395,70 +499,12 @@ void add_text_to_buffer(Tab *tab, const char *text)
         }
         wide_buffer[OUTPUT_BUFFER_SIZE - 1] = L'\0';
     }
-    else
-    {
-        wide_buffer[converted] = L'\0';
-    }
 
-    // Check if this is a command output (not a separator or prompt message)
-    int is_command_output = 1;
-    const char *non_output_patterns[] = {
-        "Welcome to X11 Shell Terminal!",
-        "Type commands like",
-        "Changed to directory:",
-        "No command history",
-        "No background jobs",
-        "fg:",
-        "cd:",
-        "Error:",
-        "Warning:",
-        "Multiple matches found:",
-        "(reverse-i-search)",
-        "Press number to select",
-        "Resumed job",
-        "Job [",
-        "Command finished",
-        "Starting multiWatch",
-        "----------------------------------------------------",
-        NULL};
+    // ADD TO SCROLLBACK BUFFER
+    wchar_t scrollback_copy[OUTPUT_BUFFER_SIZE];
+    wcscpy(scrollback_copy, wide_buffer); // Make a copy for scrollback
 
-    for (int i = 0; non_output_patterns[i] != NULL; i++)
-    {
-        if (strstr(text, non_output_patterns[i]) != NULL)
-        {
-            is_command_output = 0;
-            break;
-        }
-    }
-
-    // Add separator before command output
-    if (is_command_output && text[0] != '\0')
-    {
-        // Check if previous line wasn't already a separator
-        int prev_line_empty = 1;
-        if (tab->cursor_row >= 0 && tab->cursor_row < BUFFER_ROWS)
-        {
-            for (int col = 0; col < BUFFER_COLS; col++)
-            {
-                if (tab->text_buffer[tab->cursor_row][col] != L' ')
-                {
-                    prev_line_empty = 0;
-                    break;
-                }
-            }
-        }
-
-        if (prev_line_empty)
-        {
-            // Add separator before command output
-            add_separator_line(tab);
-
-            // Add timestamp for the command output
-            add_timestamp_line(tab);
-        }
-    }
-
-    wchar_t *line = wide_buffer;
+    wchar_t *line = scrollback_copy;
     wchar_t *newline;
 
     do
@@ -469,40 +515,22 @@ void add_text_to_buffer(Tab *tab, const char *text)
             *newline = L'\0';
         }
 
-        // Bounds checking for cursor position
-        if (tab->cursor_row < 0)
-            tab->cursor_row = 0;
-        if (tab->cursor_row >= BUFFER_ROWS)
+        // Add line to scrollback buffer
+        if (tab->scrollback_count < SCROLLBACK_LINES)
         {
-            scroll_buffer(tab);
-        }
-
-        if (tab->cursor_row >= BUFFER_ROWS - 1)
-        {
-            scroll_buffer(tab);
+            wcsncpy(tab->scrollback_buffer[tab->scrollback_count], line, BUFFER_COLS - 1);
+            tab->scrollback_buffer[tab->scrollback_count][BUFFER_COLS - 1] = L'\0';
+            tab->scrollback_count++;
         }
         else
         {
-            tab->cursor_row++;
-        }
-        tab->cursor_col = 0;
-
-        int line_len = wcslen(line);
-        int max_len = BUFFER_COLS - 1;
-        int copy_len = line_len < max_len ? line_len : max_len;
-
-        // Ensure we don't write outside buffer bounds
-        if (copy_len > 0 && tab->cursor_row >= 0 && tab->cursor_row < BUFFER_ROWS)
-        {
-            for (int i = 0; i < copy_len && i < BUFFER_COLS; i++)
+            // Scrollback buffer full, shift lines up
+            for (int i = 1; i < SCROLLBACK_LINES; i++)
             {
-                tab->text_buffer[tab->cursor_row][i] = line[i];
+                wcscpy(tab->scrollback_buffer[i - 1], tab->scrollback_buffer[i]);
             }
-            // Ensure the rest of the line is spaces
-            for (int i = copy_len; i < BUFFER_COLS; i++)
-            {
-                tab->text_buffer[tab->cursor_row][i] = L' ';
-            }
+            wcsncpy(tab->scrollback_buffer[SCROLLBACK_LINES - 1], line, BUFFER_COLS - 1);
+            tab->scrollback_buffer[SCROLLBACK_LINES - 1][BUFFER_COLS - 1] = L'\0';
         }
 
         if (newline)
@@ -511,11 +539,15 @@ void add_text_to_buffer(Tab *tab, const char *text)
         }
     } while (newline);
 
-    // Add separator after command output
-    if (is_command_output && text[0] != '\0')
-    {
-        add_separator_line(tab);
-    }
+    // Reset scrollback offset when new text is added
+    tab->scrollback_offset = 0;
+    tab->max_scrollback_offset = 0;
+
+    // Now use the ORIGINAL buffer for display processing
+    line = wide_buffer;
+
+    // Now render the updated display with scrollback + command prompt
+    render_scrollback(tab);
 }
 
 // Helper function to add separator line
@@ -611,25 +643,29 @@ void add_timestamp_line(Tab *tab)
     }
 }
 
-// Function to update the command display with proper cursor positioning
 void update_command_display(Tab *tab)
 {
+    // Use BUFFER_ROWS-2 instead of BUFFER_ROWS-1 to leave empty line at bottom
+    int command_row = BUFFER_ROWS - 2;
+
+    // Clear the command line
     for (int col = 0; col < BUFFER_COLS; col++)
     {
-        tab->text_buffer[tab->cursor_row][col] = L' ';
+        tab->text_buffer[command_row][col] = L' ';
     }
 
-    tab->text_buffer[tab->cursor_row][0] = L'>';
-    tab->text_buffer[tab->cursor_row][1] = L' ';
+    tab->text_buffer[command_row][0] = L'>';
+    tab->text_buffer[command_row][1] = L' ';
 
     int display_col = 2;
     for (int i = 0; i < tab->command_length && display_col < BUFFER_COLS; i++)
     {
-        tab->text_buffer[tab->cursor_row][display_col] = tab->current_command[i];
+        tab->text_buffer[command_row][display_col] = tab->current_command[i];
         display_col++;
     }
 
     tab->cursor_col = 2 + tab->cursor_buffer_pos;
+    tab->cursor_row = command_row; // Use the new row position
 }
 
 void handle_tab_completion(Tab *tab)
@@ -968,6 +1004,10 @@ int search_history(Tab *tab, const wchar_t *search_term, wchar_t *result, int sh
     {
         return 0;
     }
+    if (wcslen(search_term) >= MAX_COMMAND_LENGTH)
+    {
+        return 0;
+    }
 
     // Convert search term to multibyte for comparison
     char mb_search[MAX_COMMAND_LENGTH * 4] = {0};
@@ -1169,6 +1209,18 @@ void initialize_tab(Tab *tab, const char *name)
     snprintf(tab->tab_name, MAX_TAB_NAME, "%s", name);
     tab->tab_name[MAX_TAB_NAME - 1] = '\0';
 
+    // Initialize scrollback buffer
+    tab->scrollback_count = 0;
+    tab->scrollback_offset = 0;
+    tab->max_scrollback_offset = 0;
+    for (int i = 0; i < SCROLLBACK_LINES; i++)
+    {
+        for (int col = 0; col < BUFFER_COLS; col++)
+        {
+            tab->scrollback_buffer[i][col] = L' ';
+        }
+    }
+
     for (int row = 0; row < BUFFER_ROWS; row++)
     {
         for (int col = 0; col < BUFFER_COLS; col++)
@@ -1184,18 +1236,18 @@ void initialize_tab(Tab *tab, const char *name)
     int welcome_start = (BUFFER_COLS - welcome_len) / 2;
     for (int i = 0; i < welcome_len && welcome_start + i < BUFFER_COLS; i++)
     {
-        tab->text_buffer[1][welcome_start + i] = welcome_message[i];
+        tab->text_buffer[2][welcome_start + i] = welcome_message[i];
     }
 
     int instr_len = wcslen(instructions);
     int instr_start = (BUFFER_COLS - instr_len) / 2;
     for (int i = 0; i < instr_len && instr_start + i < BUFFER_COLS; i++)
     {
-        tab->text_buffer[3][instr_start + i] = instructions[i];
+        tab->text_buffer[4][instr_start + i] = instructions[i];
     }
 
-    tab->text_buffer[BUFFER_ROWS - 1][0] = L'>';
-    tab->text_buffer[BUFFER_ROWS - 1][1] = L' ';
+    tab->text_buffer[BUFFER_ROWS - 2][0] = L'>';
+    tab->text_buffer[BUFFER_ROWS - 2][1] = L' ';
 
     memset(tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
 }
@@ -1229,6 +1281,34 @@ void draw_text_buffer(Display *display, Window window, GC gc)
         return;
     if (active_tab_index < 0 || active_tab_index >= tab_count)
         return;
+
+    Tab *active_tab = &tabs[active_tab_index];
+
+    // Draw scrollback indicator if scrolled
+    if (active_tab->scrollback_offset > 0)
+    {
+        char indicator[64];
+        int total_lines = active_tab->scrollback_count;
+        int visible_lines = BUFFER_ROWS - 1;
+        int current_position = total_lines - visible_lines - active_tab->scrollback_offset;
+
+        // Show scroll position as percentage
+        int percent = 0;
+        if (total_lines > visible_lines)
+        {
+            percent = (current_position * 100) / (total_lines - visible_lines);
+            if (percent < 0)
+                percent = 0;
+            if (percent > 100)
+                percent = 100;
+        }
+
+        snprintf(indicator, sizeof(indicator), "Scroll: %d%% (%d/%d lines)",
+                 percent, current_position, total_lines);
+
+        XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
+        XDrawString(display, window, gc, 10, 15, indicator, strlen(indicator));
+    }
 
     // Draw tab headers (unchanged)
     int tab_width = BUFFER_COLS / tab_count;
@@ -1272,23 +1352,24 @@ void draw_text_buffer(Display *display, Window window, GC gc)
                     tab_display, strlen(tab_display));
     }
 
-    // Draw text content for active tab
+    // Draw text content for active tab - START FROM ROW 1 INSTEAD OF 0
     XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
 
-    Tab *active_tab = &tabs[active_tab_index];
+    active_tab = &tabs[active_tab_index];
 
-    for (int row = 0; row < BUFFER_ROWS; row++)
+    // Leave one row empty at the bottom for better visibility
+    for (int row = 0; row < BUFFER_ROWS - 1; row++) // Changed from BUFFER_ROWS to BUFFER_ROWS-1
     {
         for (int col = 0; col < BUFFER_COLS; col++)
         {
             if (active_tab->text_buffer[row][col] != L' ')
             {
                 int x = col * CHAR_WIDTH;
-                int y = (row + 1) * CHAR_HEIGHT;
+                int y = (row + 1) * CHAR_HEIGHT; // +1 to account for tab header
 
                 // Ensure we don't draw outside window
                 if (x >= 0 && x < BUFFER_COLS * CHAR_WIDTH &&
-                    y >= CHAR_HEIGHT && y < (BUFFER_ROWS + 1) * CHAR_HEIGHT)
+                    y >= CHAR_HEIGHT && y < (BUFFER_ROWS)*CHAR_HEIGHT) // Adjusted bounds
                 {
                     // Convert wide character to multibyte for X11
                     char mb_char[MB_CUR_MAX + 1];
@@ -1311,7 +1392,7 @@ void draw_text_buffer(Display *display, Window window, GC gc)
 
     // Draw cursor
     int cursor_x = active_tab->cursor_col * CHAR_WIDTH;
-    int cursor_y = (active_tab->cursor_row + 1) * CHAR_HEIGHT;
+    int cursor_y = (active_tab->cursor_row + 1) * CHAR_HEIGHT + 1;
 
     // Ensure cursor is within bounds
     if (cursor_x >= 0 && cursor_x < BUFFER_COLS * CHAR_WIDTH &&
@@ -3160,8 +3241,6 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
             update_command_display(active_tab);
         }
         break;
-
-    case XK_Home:
     case XK_a:
         if (control_pressed && !active_tab->search_mode)
         {
@@ -3170,8 +3249,6 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
             break;
         }
         goto default_case;
-
-    case XK_End:
     case XK_e:
         if (control_pressed && !active_tab->search_mode)
         {
@@ -3206,6 +3283,55 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
             }
         }
         break;
+        // In handle_keypress function, add these cases:
+    case XK_Page_Up:
+        if (!active_tab->search_mode)
+        {
+            scroll_up(active_tab);
+            draw_text_buffer(display, window, gc);
+        }
+        break;
+
+    case XK_Page_Down:
+        if (!active_tab->search_mode)
+        {
+            scroll_down(active_tab);
+            draw_text_buffer(display, window, gc);
+        }
+        break;
+
+    case XK_End:
+        if (control_pressed && !active_tab->search_mode)
+        {
+            active_tab->cursor_buffer_pos = active_tab->command_length;
+            update_command_display(active_tab);
+            break;
+        }
+        // Scroll to bottom when not in scrollback mode
+        if (active_tab->scrollback_offset > 0 && !control_pressed)
+        {
+            scroll_to_bottom(active_tab);
+            draw_text_buffer(display, window, gc);
+            break;
+        }
+        goto default_case;
+
+    case XK_Home:
+        if (control_pressed && !active_tab->search_mode)
+        {
+            active_tab->cursor_buffer_pos = 0;
+            update_command_display(active_tab);
+            break;
+        }
+        // Scroll to top when not in scrollback mode
+        if (!control_pressed && active_tab->scrollback_count > BUFFER_ROWS - 1)
+        {
+            active_tab->scrollback_offset = active_tab->max_scrollback_offset;
+            render_scrollback(active_tab);
+            draw_text_buffer(display, window, gc);
+            break;
+        }
+        goto default_case;
 
     default_case:
     default:
@@ -3486,8 +3612,24 @@ int main()
                 }
                 else
                 {
-                    printf("ButtonPress event received - focusing on window\n");
-                    XSetInputFocus(display, window, RevertToParent, CurrentTime);
+                    // Mouse wheel support
+                    if (event.xbutton.button == 4)
+                    {
+                        // Scroll up (mouse wheel up)
+                        scroll_up(&tabs[active_tab_index]);
+                        draw_text_buffer(display, window, gc);
+                    }
+                    else if (event.xbutton.button == 5)
+                    {
+                        // Scroll down (mouse wheel down)
+                        scroll_down(&tabs[active_tab_index]);
+                        draw_text_buffer(display, window, gc);
+                    }
+                    else
+                    {
+                        printf("ButtonPress event received - focusing on window\n");
+                        XSetInputFocus(display, window, RevertToParent, CurrentTime);
+                    }
                 }
                 break;
 
