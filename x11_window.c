@@ -17,6 +17,7 @@
 #include <locale.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <ctype.h>
 
 #define UTF8_BUFFER_SIZE (BUFFER_COLS * 4) // UTF-8 can be up to 4 bytes per char
 
@@ -34,6 +35,19 @@
 #define MAX_TAB_NAME 32
 #define MAX_HISTORY_SIZE 10000
 
+#define MAX_BG_JOBS 100
+
+typedef struct
+{
+    pid_t pid;
+    char status[16]; // "Running" or "Stopped"
+    char command[MAX_COMMAND_LENGTH];
+    int job_id;
+} BGProcess;
+
+BGProcess bg_processes[MAX_BG_JOBS];
+int job_counter = 0;
+int bg_job_count = 0;
 
 typedef struct
 {
@@ -78,7 +92,7 @@ volatile sig_atomic_t which_signal = 0;
 void update_command_display_with_prompt(Tab *tab, const char *prompt);
 void handle_tab_completion(Tab *tab);
 void enter_search_mode(Tab *tab);
-int search_history(Tab *tab, const wchar_t *search_term, wchar_t *result);
+int search_history(Tab *tab, const wchar_t *search_term, wchar_t *result, int show_multiple);
 void close_current_tab();
 void add_text_to_buffer(Tab *tab, const char *text);
 void handle_multiwatch_command(Display *display, Window window, GC gc, Tab *tab, const char *command);
@@ -106,6 +120,24 @@ void cleanup_resources(Display *display, Window window, GC gc)
 
     // Cleanup multiwatch first
     cleanup_multiwatch();
+
+    // Cleanup background processes
+    for (int i = 0; i < bg_job_count; i++)
+    {
+        if (bg_processes[i].pid > 0)
+        {
+            printf("Killing background process %d\n", bg_processes[i].pid);
+            kill(bg_processes[i].pid, SIGTERM);
+            usleep(50000);
+            int status;
+            if (waitpid(bg_processes[i].pid, &status, WNOHANG) == 0)
+            {
+                kill(bg_processes[i].pid, SIGKILL);
+                waitpid(bg_processes[i].pid, &status, 0);
+            }
+        }
+    }
+    bg_job_count = 0;
 
     // Kill any running processes in tabs
     for (int i = 0; i < tab_count; i++)
@@ -138,6 +170,31 @@ void cleanup_resources(Display *display, Window window, GC gc)
     printf("Cleanup completed.\n");
 }
 
+void handle_sigsegv(int sig)
+{
+    fprintf(stderr, "Segmentation fault occurred!\n");
+    fprintf(stderr, "Debug info:\n");
+    fprintf(stderr, "Active tab: %d, Tab count: %d\n", active_tab_index, tab_count);
+
+    if (active_tab_index >= 0 && active_tab_index < tab_count)
+    {
+        Tab *tab = &tabs[active_tab_index];
+        fprintf(stderr, "Search mode: %d, Search pos: %d\n", tab->search_mode, tab->search_pos);
+        fprintf(stderr, "Command length: %d, History count: %d\n", tab->command_length, tab->history_count);
+
+        // Add more detailed info
+        fprintf(stderr, "Search buffer: '%.*s'\n", tab->search_pos, tab->search_buffer);
+        fprintf(stderr, "Current command: '%.*s'\n", tab->command_length, tab->current_command);
+    }
+
+    // Print backtrace if possible
+    fprintf(stderr, "Stack trace:\n");
+    void *array[10];
+    size_t size = backtrace(array, 10);
+    backtrace_symbols_fd(array, size, STDERR_FILENO);
+
+    exit(1);
+}
 // Safe command validation function
 int is_safe_command(const char *command)
 {
@@ -146,10 +203,9 @@ int is_safe_command(const char *command)
 
     // Basic checks for obviously dangerous patterns
     const char *dangerous_patterns[] = {
-        ";;", "&&", "||", "`", "$(", "> /dev/", "> /proc/", 
-    "| tee", "> /etc/", "> /boot/", ">> /etc/", "sudo", 
-    "chmod 777", "chown root", NULL
-    };
+        ";;", "&&", "||", "`", "$(", "> /dev/", "> /proc/",
+        "| tee", "> /etc/", "> /boot/", ">> /etc/", "sudo",
+        "chmod 777", "chown root", NULL};
 
     for (int i = 0; dangerous_patterns[i] != NULL; i++)
     {
@@ -319,7 +375,7 @@ void scroll_buffer(Tab *tab)
     }
 }
 
-// Function to add text to the buffer, handling line breaks and scrolling
+// Function to add text to the buffer with separators and timestamps
 void add_text_to_buffer(Tab *tab, const char *text)
 {
     if (!tab || !text)
@@ -342,6 +398,64 @@ void add_text_to_buffer(Tab *tab, const char *text)
     else
     {
         wide_buffer[converted] = L'\0';
+    }
+
+    // Check if this is a command output (not a separator or prompt message)
+    int is_command_output = 1;
+    const char *non_output_patterns[] = {
+        "Welcome to X11 Shell Terminal!",
+        "Type commands like",
+        "Changed to directory:",
+        "No command history",
+        "No background jobs",
+        "fg:",
+        "cd:",
+        "Error:",
+        "Warning:",
+        "Multiple matches found:",
+        "(reverse-i-search)",
+        "Press number to select",
+        "Resumed job",
+        "Job [",
+        "Command finished",
+        "Starting multiWatch",
+        "----------------------------------------------------",
+        NULL};
+
+    for (int i = 0; non_output_patterns[i] != NULL; i++)
+    {
+        if (strstr(text, non_output_patterns[i]) != NULL)
+        {
+            is_command_output = 0;
+            break;
+        }
+    }
+
+    // Add separator before command output
+    if (is_command_output && text[0] != '\0')
+    {
+        // Check if previous line wasn't already a separator
+        int prev_line_empty = 1;
+        if (tab->cursor_row >= 0 && tab->cursor_row < BUFFER_ROWS)
+        {
+            for (int col = 0; col < BUFFER_COLS; col++)
+            {
+                if (tab->text_buffer[tab->cursor_row][col] != L' ')
+                {
+                    prev_line_empty = 0;
+                    break;
+                }
+            }
+        }
+
+        if (prev_line_empty)
+        {
+            // Add separator before command output
+            add_separator_line(tab);
+
+            // Add timestamp for the command output
+            add_timestamp_line(tab);
+        }
     }
 
     wchar_t *line = wide_buffer;
@@ -396,6 +510,105 @@ void add_text_to_buffer(Tab *tab, const char *text)
             line = newline + 1;
         }
     } while (newline);
+
+    // Add separator after command output
+    if (is_command_output && text[0] != '\0')
+    {
+        add_separator_line(tab);
+    }
+}
+
+// Helper function to add separator line
+void add_separator_line(Tab *tab)
+{
+    if (!tab)
+        return;
+
+    // Scroll if needed
+    if (tab->cursor_row >= BUFFER_ROWS - 1)
+    {
+        scroll_buffer(tab);
+    }
+    else
+    {
+        tab->cursor_row++;
+    }
+    tab->cursor_col = 0;
+
+    // Create separator line
+    wchar_t separator[BUFFER_COLS + 1];
+    int sep_length = BUFFER_COLS - 1;
+    for (int i = 0; i < sep_length; i++)
+    {
+        separator[i] = L'-';
+    }
+    separator[sep_length] = L'\0';
+
+    // Add separator to buffer
+    int copy_len = wcslen(separator);
+    if (copy_len > BUFFER_COLS)
+        copy_len = BUFFER_COLS;
+
+    for (int i = 0; i < copy_len && tab->cursor_row < BUFFER_ROWS; i++)
+    {
+        tab->text_buffer[tab->cursor_row][i] = separator[i];
+    }
+
+    // Fill rest with spaces
+    for (int i = copy_len; i < BUFFER_COLS; i++)
+    {
+        tab->text_buffer[tab->cursor_row][i] = L' ';
+    }
+}
+
+// Helper function to add timestamp line
+void add_timestamp_line(Tab *tab)
+{
+    if (!tab)
+        return;
+
+    // Scroll if needed
+    if (tab->cursor_row >= BUFFER_ROWS - 1)
+    {
+        scroll_buffer(tab);
+    }
+    else
+    {
+        tab->cursor_row++;
+    }
+    tab->cursor_col = 0;
+
+    // Get current time
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "[%H:%M:%S] Output: ", tm_info);
+
+    // Convert to wide characters
+    wchar_t wide_timestamp[BUFFER_COLS];
+    size_t converted = mbstowcs(wide_timestamp, timestamp, BUFFER_COLS - 1);
+    if (converted == (size_t)-1)
+    {
+        // Fallback
+        for (int i = 0; timestamp[i] != '\0' && i < BUFFER_COLS - 1; i++)
+        {
+            wide_timestamp[i] = (wchar_t)timestamp[i];
+        }
+        wide_timestamp[BUFFER_COLS - 1] = L'\0';
+    }
+
+    // Add timestamp to buffer
+    int timestamp_len = wcslen(wide_timestamp);
+    for (int i = 0; i < timestamp_len && i < BUFFER_COLS; i++)
+    {
+        tab->text_buffer[tab->cursor_row][i] = wide_timestamp[i];
+    }
+
+    // Fill rest with spaces
+    for (int i = timestamp_len; i < BUFFER_COLS; i++)
+    {
+        tab->text_buffer[tab->cursor_row][i] = L' ';
+    }
 }
 
 // Function to update the command display with proper cursor positioning
@@ -655,27 +868,85 @@ void add_to_history(Tab *tab, const char *command)
     tab->history_current = tab->history_count;
 }
 
-// Function to search history
-int search_history(Tab *tab, const wchar_t *search_term, wchar_t *result)
+// Simple and reliable longest common substring function
+int find_longest_common_substring(const char *str1, const char *str2)
 {
-    for (int i = tab->history_count - 1; i >= 0; i--)
+    if (!str1 || !str2 || str1[0] == '\0' || str2[0] == '\0')
     {
-        if (wcsstr(tab->command_history[i], search_term) != NULL)
+        return 0;
+    }
+
+    int len1 = strlen(str1);
+    int len2 = strlen(str2);
+    int max_len = 0;
+
+    printf("DEBUG LCS: Comparing '%s' (%d) and '%s' (%d)\n", str1, len1, str2, len2);
+
+    // Simple approach: check if str1 is a substring of str2
+    if (strstr(str2, str1) != NULL)
+    {
+        printf("DEBUG LCS: Found exact substring match: %d\n", len1);
+        return len1;
+    }
+
+    // Try case-insensitive match
+    char str2_lower[1024];
+    strncpy(str2_lower, str2, sizeof(str2_lower) - 1);
+    str2_lower[sizeof(str2_lower) - 1] = '\0';
+
+    for (int i = 0; str2_lower[i]; i++)
+    {
+        str2_lower[i] = tolower(str2_lower[i]);
+    }
+
+    char str1_lower[1024];
+    strncpy(str1_lower, str1, sizeof(str1_lower) - 1);
+    str1_lower[sizeof(str1_lower) - 1] = '\0';
+
+    for (int i = 0; str1_lower[i]; i++)
+    {
+        str1_lower[i] = tolower(str1_lower[i]);
+    }
+
+    if (strstr(str2_lower, str1_lower) != NULL)
+    {
+        printf("DEBUG LCS: Found case-insensitive substring match: %d\n", len1);
+        return len1;
+    }
+
+    // Find longest common substring using dynamic programming approach
+    for (int i = 0; i < len1; i++)
+    {
+        for (int j = 0; j < len2; j++)
         {
-            wcscpy(result, tab->command_history[i]);
-            return 1;
+            int k = 0;
+            while (i + k < len1 && j + k < len2 &&
+                   tolower(str1[i + k]) == tolower(str2[j + k]))
+            {
+                k++;
+            }
+            if (k > max_len)
+            {
+                max_len = k;
+                printf("DEBUG LCS: New max_len=%d at i=%d,j=%d\n", max_len, i, j);
+            }
         }
     }
-    return 0;
-}
 
-// Function to enter search mode
+    printf("DEBUG LCS: Final max_len=%d\n", max_len);
+    return max_len;
+}
+// Fix enter_search_mode - better initialization
 void enter_search_mode(Tab *tab)
 {
+    if (!tab)
+        return;
+
     tab->search_mode = 1;
     tab->search_pos = 0;
-    tab->search_buffer[0] = L'\0';
+    memset(tab->search_buffer, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
 
+    // Clear current command safely
     memset(tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
     tab->command_length = 0;
     tab->cursor_buffer_pos = 0;
@@ -683,28 +954,174 @@ void enter_search_mode(Tab *tab)
     update_command_display_with_prompt(tab, "(reverse-i-search)`': ");
 }
 
-// Function to handle history built-in command
+// Add this debug function
+void debug_search(const char *search_term, const char *history_entry, int match_len)
+{
+    printf("DEBUG SEARCH: search='%s', history='%s', match_len=%d\n",
+           search_term, history_entry, match_len);
+}
+
+// Enhanced search_history function with proper multiple match display
+int search_history(Tab *tab, const wchar_t *search_term, wchar_t *result, int show_multiple)
+{
+    if (!tab || !search_term || !result || wcslen(search_term) == 0)
+    {
+        return 0;
+    }
+
+    // Convert search term to multibyte for comparison
+    char mb_search[MAX_COMMAND_LENGTH * 4] = {0};
+    size_t converted = wcstombs(mb_search, search_term, sizeof(mb_search) - 1);
+    if (converted == (size_t)-1)
+    {
+        for (int i = 0; i < MAX_COMMAND_LENGTH - 1 && search_term[i] != L'\0'; i++)
+        {
+            mb_search[i] = (char)search_term[i];
+        }
+        mb_search[wcslen(search_term)] = '\0';
+    }
+
+#define MAX_DISPLAY_MATCHES 10
+
+    typedef struct
+    {
+        wchar_t command[MAX_COMMAND_LENGTH];
+        int match_length;
+        int history_index;
+    } HistoryMatch;
+
+    HistoryMatch matches[MAX_DISPLAY_MATCHES] = {0};
+    int match_count = 0;
+
+    // Search through history for matches
+    for (int i = tab->history_count - 1; i >= 0; i--)
+    {
+        if (tab->command_history[i][0] == L'\0')
+            continue;
+
+        // Convert history entry to multibyte for comparison
+        char mb_history[MAX_COMMAND_LENGTH * 4] = {0};
+        converted = wcstombs(mb_history, tab->command_history[i], sizeof(mb_history) - 1);
+        if (converted == (size_t)-1)
+        {
+            for (int j = 0; j < MAX_COMMAND_LENGTH - 1 && tab->command_history[i][j] != L'\0'; j++)
+            {
+                mb_history[j] = (char)tab->command_history[i][j];
+            }
+            mb_history[wcslen(tab->command_history[i])] = '\0';
+        }
+
+        // Find the longest common substring
+        int match_len = find_longest_common_substring(mb_search, mb_history);
+
+        // Allow single character searches
+        if (match_len >= 1 && match_count < MAX_DISPLAY_MATCHES)
+        {
+            matches[match_count].match_length = match_len;
+            matches[match_count].history_index = i;
+            wcsncpy(matches[match_count].command, tab->command_history[i], MAX_COMMAND_LENGTH - 1);
+            matches[match_count].command[MAX_COMMAND_LENGTH - 1] = L'\0';
+            match_count++;
+        }
+    }
+
+    if (match_count == 0)
+    {
+        return show_multiple ? -1 : 0;
+    }
+
+    // NEW: If showing multiple matches, display them in the terminal
+    if (show_multiple && match_count > 1)
+    {
+        add_text_to_buffer(tab, "");
+        add_text_to_buffer(tab, "Multiple matches found:");
+
+        // Display each matching command
+        for (int i = 0; i < match_count; i++)
+        {
+            char match_line[256];
+            char mb_command[MAX_COMMAND_LENGTH * 4] = {0};
+
+            // Convert the matching command to multibyte for display
+            wcstombs(mb_command, matches[i].command, sizeof(mb_command) - 1);
+            mb_command[sizeof(mb_command) - 1] = '\0';
+
+            snprintf(match_line, sizeof(match_line), "  %d: %s", i + 1, mb_command);
+            add_text_to_buffer(tab, match_line);
+        }
+
+        add_text_to_buffer(tab, "Press number to select or refine search");
+        return match_count;
+    }
+
+    // Return the best single match
+    if (match_count > 0)
+    {
+        int best_match_index = 0;
+        for (int i = 1; i < match_count; i++)
+        {
+            if (matches[i].match_length > matches[best_match_index].match_length)
+            {
+                best_match_index = i;
+            }
+        }
+        wcsncpy(result, matches[best_match_index].command, MAX_COMMAND_LENGTH - 1);
+        result[MAX_COMMAND_LENGTH - 1] = L'\0';
+        return 1;
+    }
+
+    return 0;
+}
+
 void handle_history_command(Tab *tab)
 {
+    if (tab->history_count == 0)
+    {
+        add_text_to_buffer(tab, "No command history");
+        return;
+    }
+
     int start = (tab->history_count > 10) ? tab->history_count - 10 : 0;
     for (int i = start; i < tab->history_count; i++)
     {
+        // Convert wide char history to multibyte for display
         char history_line[256];
-        snprintf(history_line, sizeof(history_line), "%d: %s", i + 1, tab->command_history[i]);
+        char mb_command[MAX_COMMAND_LENGTH * 4];
+
+        // Convert wide character command to multibyte
+        size_t converted = wcstombs(mb_command, tab->command_history[i], sizeof(mb_command) - 1);
+        if (converted == (size_t)-1)
+        {
+            // Fallback: convert each wide char individually
+            int j;
+            for (j = 0; j < MAX_COMMAND_LENGTH - 1 && tab->command_history[i][j] != L'\0'; j++)
+            {
+                mb_command[j] = (char)tab->command_history[i][j];
+            }
+            mb_command[j] = '\0';
+        }
+        else
+        {
+            mb_command[converted] = '\0';
+        }
+
+        snprintf(history_line, sizeof(history_line), "%d: %.200s", i + 1, mb_command);
         add_text_to_buffer(tab, history_line);
     }
 }
 
-// Function to update display with custom prompt
 void update_command_display_with_prompt(Tab *tab, const char *prompt)
 {
+    if (!tab || !prompt)
+        return;
+
     for (int col = 0; col < BUFFER_COLS; col++)
     {
         tab->text_buffer[tab->cursor_row][col] = L' ';
     }
 
-    // Convert prompt to wide characters
-    wchar_t wide_prompt[BUFFER_COLS];
+    // Convert prompt to wide characters with bounds checking
+    wchar_t wide_prompt[BUFFER_COLS] = {0};
     size_t converted = mbstowcs(wide_prompt, prompt, BUFFER_COLS - 1);
     if (converted == (size_t)-1)
     {
@@ -730,6 +1147,10 @@ void update_command_display_with_prompt(Tab *tab, const char *prompt)
     }
 
     tab->cursor_col = prompt_len + tab->search_pos;
+    if (tab->cursor_col >= BUFFER_COLS)
+    {
+        tab->cursor_col = BUFFER_COLS - 1;
+    }
 }
 
 // Function to initialize a tab's text buffer
@@ -991,16 +1412,23 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
             if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1)
             {
                 ssize_t bytes_read = read(multiwatch_processes[i].fd, buffer, sizeof(buffer) - 1);
+                // In monitor_multiwatch_processes function, update the output section:
                 if (bytes_read > 0)
                 {
-                    data_read = 1;
                     buffer[bytes_read] = '\0';
 
-                    // Add timestamp and command name
+                    // Add separator and timestamp for multiwatch output
+                    add_separator_line(tab);
+
+                    // Add multiwatch-specific timestamp
                     time_t now = time(NULL);
                     struct tm *tm_info = localtime(&now);
                     char timestamp[64];
-                    strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
+                    strftime(timestamp, sizeof(timestamp), "[%H:%M:%S] ", tm_info);
+
+                    char header[128];
+                    snprintf(header, sizeof(header), "%sMultiWatch [%s]:", timestamp, multiwatch_processes[i].command);
+                    add_text_to_buffer(tab, header);
 
                     // Split output by lines and add each line
                     char *line = buffer;
@@ -1017,11 +1445,8 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
                         if (strlen(line) > 0)
                         {
                             char output_line[BUFFER_COLS];
-                            snprintf(output_line, sizeof(output_line), "[%s] %s: %s",
-                                     timestamp, multiwatch_processes[i].command, line);
-
+                            snprintf(output_line, sizeof(output_line), "  %s", line);
                             add_text_to_buffer(tab, output_line);
-                            printf("Output: %s\n", output_line);
                         }
 
                         if (newline)
@@ -1030,6 +1455,7 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
                         }
                     } while (newline);
 
+                    add_separator_line(tab);
                     draw_text_buffer(display, window, gc);
                 }
                 else if (bytes_read == 0)
@@ -1494,14 +1920,154 @@ void handle_multiwatch_command(Display *display, Window window, GC gc, Tab *tab,
     monitor_multiwatch_processes(display, window, gc, tab);
 }
 
+void handle_jobs_command(Tab *tab)
+{
+    if (bg_job_count == 0)
+    {
+        add_text_to_buffer(tab, "No background jobs");
+        return;
+    }
+
+    // Clean up finished processes first
+    for (int i = 0; i < bg_job_count; i++)
+    {
+        int status;
+        pid_t result = waitpid(bg_processes[i].pid, &status, WNOHANG);
+        if (result > 0)
+        {
+            // Process has finished, remove from array
+            for (int j = i; j < bg_job_count - 1; j++)
+            {
+                bg_processes[j] = bg_processes[j + 1];
+            }
+            bg_job_count--;
+            i--; // Check the new element at this position
+        }
+    }
+
+    // Display remaining jobs
+    for (int i = 0; i < bg_job_count; i++)
+    {
+        char job_info[256];
+        snprintf(job_info, sizeof(job_info), "[%d] %s    %s",
+                 bg_processes[i].job_id, bg_processes[i].status, bg_processes[i].command);
+        add_text_to_buffer(tab, job_info);
+    }
+}
+
+void handle_fg_command(Tab *tab, const char *command)
+{
+    if (bg_job_count == 0)
+    {
+        add_text_to_buffer(tab, "fg: no current job");
+        return;
+    }
+
+    // Parse job ID
+    int job_id = -1;
+    if (sscanf(command, "fg %d", &job_id) != 1)
+    {
+        // If no job ID specified, use the most recent job
+        job_id = job_counter;
+    }
+
+    // Find the job
+    int job_index = -1;
+    for (int i = 0; i < bg_job_count; i++)
+    {
+        if (bg_processes[i].job_id == job_id)
+        {
+            job_index = i;
+            break;
+        }
+    }
+
+    if (job_index == -1)
+    {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), "fg: job not found: %d", job_id);
+        add_text_to_buffer(tab, error_msg);
+        return;
+    }
+
+    // Bring to foreground
+    pid_t pid = bg_processes[job_index].pid;
+
+    // Send SIGCONT to resume if stopped
+    if (strcmp(bg_processes[job_index].status, "Stopped") == 0)
+    {
+        if (kill(pid, SIGCONT) == -1)
+        {
+            char error_msg[256];
+            snprintf(error_msg, sizeof(error_msg), "fg: failed to resume job %d: %s",
+                     job_id, strerror(errno));
+            add_text_to_buffer(tab, error_msg);
+            return;
+        }
+    }
+
+    // Set as foreground process in tab
+    tab->foreground_pid = pid;
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Resumed job [%d] in foreground: %s", job_id, bg_processes[job_index].command);
+    add_text_to_buffer(tab, msg);
+
+    // Wait for process to complete
+    int status;
+    pid_t result = waitpid(pid, &status, 0);
+
+    if (result == -1)
+    {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), "fg: error waiting for job %d: %s",
+                 job_id, strerror(errno));
+        add_text_to_buffer(tab, error_msg);
+    }
+    else
+    {
+        if (WIFEXITED(status))
+        {
+            char exit_msg[256];
+            snprintf(exit_msg, sizeof(exit_msg), "Job [%d] exited with status %d",
+                     job_id, WEXITSTATUS(status));
+            add_text_to_buffer(tab, exit_msg);
+        }
+        else if (WIFSIGNALED(status))
+        {
+            char signal_msg[256];
+            snprintf(signal_msg, sizeof(signal_msg), "Job [%d] terminated by signal %d",
+                     job_id, WTERMSIG(status));
+            add_text_to_buffer(tab, signal_msg);
+        }
+    }
+
+    // Remove from background processes array
+    for (int i = job_index; i < bg_job_count - 1; i++)
+    {
+        bg_processes[i] = bg_processes[i + 1];
+    }
+    bg_job_count--;
+    tab->foreground_pid = -1;
+}
+
 // Function to execute a command and capture its output
 void execute_command(Display *display, Window window, GC gc, Tab *tab, const char *command)
 {
+    if (!display || !window || !gc || !tab)
+    {
+        printf("Error: Invalid parameters to execute_command\n");
+        return;
+    }
+
     if (command == NULL || strlen(command) == 0)
     {
         add_text_to_buffer(tab, "");
         return;
     }
+
+    printf("Executing command: '%s'\n", command);
+
     // Add security validation
     if (!is_safe_command(command))
     {
@@ -1516,6 +2082,7 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         add_text_to_buffer(tab, "Error: Command too long");
         return;
     }
+    command_copy[sizeof(command_copy) - 1] = '\0';
 
     // Check for multiWatch command first
     if (strncmp(command, "multiWatch", 10) == 0)
@@ -1524,7 +2091,7 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         return;
     }
 
-    char *args[64];
+    char *args[64] = {0};
     int arg_count = 0;
     char *token = strtok(command_copy, " ");
     while (token != NULL && arg_count < 63)
@@ -1562,7 +2129,6 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 add_text_to_buffer(tab, "Changed directory (but cannot get current path)");
             }
         }
-        handle_history_command(tab);
         return;
     }
 
@@ -1572,6 +2138,28 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         return;
     }
 
+    if (arg_count > 0 && strcmp(args[0], "jobs") == 0)
+    {
+        handle_jobs_command(tab);
+        return;
+    }
+
+    if (arg_count > 0 && strncmp(args[0], "fg", 2) == 0)
+    {
+        handle_fg_command(tab, command);
+        return;
+    }
+
+    // ADD COMMAND HEADER WITH TIMESTAMP
+    char command_header[512];
+    time_t start_time = time(NULL);
+    struct tm *tm_info = localtime(&start_time);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "[%H:%M:%S]", tm_info);
+    snprintf(command_header, sizeof(command_header), "%s Executing: %s", timestamp, command);
+    add_text_to_buffer(tab, command_header);
+    add_separator_line(tab);
+
     int num_commands = 1;
     char *commands[16];
     char command_copy2[MAX_COMMAND_LENGTH];
@@ -1579,6 +2167,7 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
     if (snprintf(command_copy2, sizeof(command_copy2), "%s", command) >= (int)sizeof(command_copy2))
     {
         add_text_to_buffer(tab, "Error: Command too long");
+        add_separator_line(tab); // Close the section even on error
         return;
     }
     command_copy2[sizeof(command_copy2) - 1] = '\0';
@@ -1599,6 +2188,7 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             char error_msg[256];
             snprintf(error_msg, sizeof(error_msg), "Error: Failed to create pipe: %s", strerror(errno));
             add_text_to_buffer(tab, error_msg);
+            add_separator_line(tab);
             return;
         }
 
@@ -1611,17 +2201,19 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             char error_msg[256];
             snprintf(error_msg, sizeof(error_msg), "Error: Fork failed: %s", strerror(errno));
             add_text_to_buffer(tab, error_msg);
+            add_separator_line(tab);
             return;
         }
         else if (pid == 0)
         {
-            // Child process
+            // Child process (UNCHANGED - same as your version)
             signal(SIGINT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL);
 
             if (close(pipefd[0]) == -1)
             {
                 perror("close pipefd[0] failed");
+                exit(1);
             }
 
             if (dup2(pipefd[1], STDOUT_FILENO) == -1)
@@ -1717,7 +2309,7 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
 
             execvp(args[0], args);
             fprintf(stderr, "Error: Command not found: %s (%s)\n", args[0], strerror(errno));
-            exit(127); // Standard exit code for command not found
+            exit(127);
         }
         else
         {
@@ -1742,7 +2334,7 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
 
             int child_exited = 0;
             int timeout_counter = 0;
-            const int MAX_TIMEOUT = 300; // 3 seconds max
+            const int MAX_TIMEOUT = 300;
 
             while (!child_exited && timeout_counter < MAX_TIMEOUT)
             {
@@ -1869,7 +2461,6 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             {
                 if (waitpid(pid, &status, WNOHANG) == 0)
                 {
-                    // Process still running, kill it
                     if (kill(pid, SIGKILL) == -1)
                     {
                         printf("Warning: Failed to kill process: %s\n", strerror(errno));
@@ -1880,8 +2471,10 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
 
             tab->foreground_pid = -1;
 
+            // OUTPUT HANDLING WITH SEPARATORS
             if (full_output_len > 0)
             {
+                // The new add_text_to_buffer will handle separators automatically
                 add_text_to_buffer(tab, full_output);
             }
             else if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
@@ -1898,10 +2491,14 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             }
             else
             {
-                add_text_to_buffer(tab, "");
+                add_text_to_buffer(tab, "(Command executed successfully - no output)");
             }
+
+            // ADD FINAL SEPARATOR
+            add_separator_line(tab);
         }
     }
+
     else
     {
         // Multi-command pipeline
@@ -2177,7 +2774,10 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         {
             add_text_to_buffer(tab, "");
         }
+        add_separator_line(tab);
     }
+
+    draw_text_buffer(display, window, gc);
 }
 
 // Function to handle Enter key - executes command and shows output
@@ -2304,6 +2904,8 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
             memset(active_tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
             active_tab->command_length = 0;
             active_tab->cursor_buffer_pos = 0;
+            active_tab->search_pos = 0;
+            memset(active_tab->search_buffer, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
             update_command_display(active_tab);
         }
         else
@@ -2317,17 +2919,66 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
     case XK_KP_Enter:
         if (active_tab->search_mode)
         {
+            // Exit search mode first
             active_tab->search_mode = 0;
+
             if (active_tab->search_pos > 0)
             {
-                wchar_t found_command[MAX_COMMAND_LENGTH];
-                if (search_history(active_tab, active_tab->search_buffer, found_command))
+                wchar_t found_command[MAX_COMMAND_LENGTH] = {0};
+                int result = search_history(active_tab, active_tab->search_buffer, found_command, 1);
+
+                if (result == 1)
                 {
+                    // Single match found - use it
                     wcscpy(active_tab->current_command, found_command);
                     active_tab->command_length = wcslen(active_tab->current_command);
                     active_tab->cursor_buffer_pos = active_tab->command_length;
                 }
+                else if (result > 1)
+                {
+                    // Multiple matches found - show them
+                    add_text_to_buffer(active_tab, "");
+                    add_text_to_buffer(active_tab, "Multiple matches found:");
+
+                    // Don't re-search - just show the count
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Found %d matches. Refine your search.", result);
+                    add_text_to_buffer(active_tab, msg);
+
+                    // Clear command since we have multiple matches
+                    memset(active_tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
+                    active_tab->command_length = 0;
+                    active_tab->cursor_buffer_pos = 0;
+                }
+                else if (result == -1)
+                {
+                    // No matches found
+                    add_text_to_buffer(active_tab, "No match for search term in history");
+                    memset(active_tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
+                    active_tab->command_length = 0;
+                    active_tab->cursor_buffer_pos = 0;
+                }
+                else
+                {
+                    // No match found (result == 0)
+                    memset(active_tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
+                    active_tab->command_length = 0;
+                    active_tab->cursor_buffer_pos = 0;
+                }
             }
+            else
+            {
+                // Empty search - clear command
+                memset(active_tab->current_command, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
+                active_tab->command_length = 0;
+                active_tab->cursor_buffer_pos = 0;
+            }
+
+            // Reset search state
+            active_tab->search_pos = 0;
+            memset(active_tab->search_buffer, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
+
+            // Return to normal display
             update_command_display(active_tab);
         }
         else
@@ -2335,7 +2986,6 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
             handle_enter_key(display, window, gc, active_tab);
         }
         break;
-
     case XK_n:
         if (control_pressed)
         {
@@ -2401,6 +3051,41 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
             {
                 active_tab->search_pos--;
                 active_tab->search_buffer[active_tab->search_pos] = L'\0';
+
+                // Update display
+                char prompt[256];
+                char mb_search[MAX_COMMAND_LENGTH * 4] = {0};
+                size_t converted = wcstombs(mb_search, active_tab->search_buffer, sizeof(mb_search) - 1);
+                if (converted == (size_t)-1)
+                {
+                    for (int i = 0; i < active_tab->search_pos && i < sizeof(mb_search) - 1; i++)
+                    {
+                        mb_search[i] = (char)active_tab->search_buffer[i];
+                    }
+                    mb_search[active_tab->search_pos] = '\0';
+                }
+
+                // Perform search with updated term
+                wchar_t found_command[MAX_COMMAND_LENGTH] = {0};
+                int result = search_history(active_tab, active_tab->search_buffer, found_command, 0);
+
+                if (result == 1)
+                {
+                    char mb_found[MAX_COMMAND_LENGTH * 4] = {0};
+                    wcstombs(mb_found, found_command, sizeof(mb_found) - 1);
+                    mb_found[sizeof(mb_found) - 1] = '\0';
+                    snprintf(prompt, sizeof(prompt), "(reverse-i-search)`%s': %s", mb_search, mb_found);
+                }
+                else
+                {
+                    snprintf(prompt, sizeof(prompt), "(reverse-i-search)`%s': ", mb_search);
+                }
+
+                update_command_display_with_prompt(active_tab, prompt);
+            }
+            else
+            {
+                // No more characters to delete
                 update_command_display_with_prompt(active_tab, "(reverse-i-search)`': ");
             }
         }
@@ -2533,12 +3218,45 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
                     active_tab->search_buffer[active_tab->search_pos] = wide_char;
                     active_tab->search_pos++;
                     active_tab->search_buffer[active_tab->search_pos] = L'\0';
-                    update_command_display_with_prompt(active_tab, "(reverse-i-search)`': ");
+
+                    // Update display with current search
+                    char prompt[256];
+                    char mb_search[MAX_COMMAND_LENGTH * 4] = {0};
+
+                    // Safe conversion from wide char to multibyte
+                    size_t converted = wcstombs(mb_search, active_tab->search_buffer, sizeof(mb_search) - 1);
+                    if (converted == (size_t)-1)
+                    {
+                        // Fallback conversion
+                        for (int i = 0; i < active_tab->search_pos && i < sizeof(mb_search) - 1; i++)
+                        {
+                            mb_search[i] = (char)active_tab->search_buffer[i];
+                        }
+                        mb_search[active_tab->search_pos] = '\0';
+                    }
+
+                    wchar_t found_command[MAX_COMMAND_LENGTH] = {0};
+                    int result = search_history(active_tab, active_tab->search_buffer, found_command, 0);
+
+                    if (result == 1)
+                    {
+                        char mb_found[MAX_COMMAND_LENGTH * 4] = {0};
+                        wcstombs(mb_found, found_command, sizeof(mb_found) - 1);
+                        mb_found[sizeof(mb_found) - 1] = '\0';
+                        snprintf(prompt, sizeof(prompt), "(reverse-i-search)`%s': %s", mb_search, mb_found);
+                    }
+                    else
+                    {
+                        snprintf(prompt, sizeof(prompt), "(reverse-i-search)`%s': ", mb_search);
+                    }
+
+                    update_command_display_with_prompt(active_tab, prompt);
                 }
             }
         }
         else
         {
+            // Normal command input (existing code)
             if (wide_char != L'\0' && iswprint(wide_char) && !control_pressed)
             {
                 if (active_tab->command_length < MAX_COMMAND_LENGTH - 1)
@@ -2552,20 +3270,6 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
                     active_tab->current_command[active_tab->command_length] = L'\0';
                     active_tab->cursor_buffer_pos++;
                     update_command_display(active_tab);
-
-                    // Debug output - convert wide string to multibyte for printf
-                    char mb_command[MAX_COMMAND_LENGTH * 4];
-                    size_t converted = wcstombs(mb_command, active_tab->current_command, sizeof(mb_command) - 1);
-                    if (converted == (size_t)-1)
-                    {
-                        // Fallback to ASCII
-                        for (int i = 0; i < active_tab->command_length && i < sizeof(mb_command) - 1; i++)
-                        {
-                            mb_command[i] = (char)active_tab->current_command[i];
-                        }
-                        mb_command[active_tab->command_length] = '\0';
-                    }
-                    printf("Current command: '%s', cursor at: %d\n", mb_command, active_tab->cursor_buffer_pos);
                 }
             }
         }
@@ -2595,6 +3299,50 @@ void handle_sigtstp(int sig)
 {
     signal_received = 1;
     which_signal = SIGTSTP;
+
+    Tab *active_tab = &tabs[active_tab_index];
+
+    if (active_tab->foreground_pid > 0)
+    {
+        // Stop the foreground process instead of killing it
+        if (kill(active_tab->foreground_pid, SIGSTOP) == -1)
+        {
+            printf("Warning: Failed to send SIGSTOP to process %d: %s\n",
+                   active_tab->foreground_pid, strerror(errno));
+            return;
+        }
+
+        // Add to background processes array
+        if (bg_job_count < MAX_BG_JOBS)
+        {
+            bg_processes[bg_job_count].pid = active_tab->foreground_pid;
+            strcpy(bg_processes[bg_job_count].status, "Stopped");
+
+            // Get the command that was executed (you might want to store this earlier)
+            char mb_command[MAX_COMMAND_LENGTH * 4];
+            size_t converted = wcstombs(mb_command, active_tab->current_command, sizeof(mb_command) - 1);
+            if (converted == (size_t)-1)
+            {
+                strcpy(bg_processes[bg_job_count].command, "unknown");
+            }
+            else
+            {
+                strncpy(bg_processes[bg_job_count].command, mb_command, MAX_COMMAND_LENGTH - 1);
+                bg_processes[bg_job_count].command[MAX_COMMAND_LENGTH - 1] = '\0';
+            }
+
+            bg_processes[bg_job_count].job_id = ++job_counter;
+            bg_job_count++;
+
+            // Print job information
+            char job_msg[256];
+            snprintf(job_msg, sizeof(job_msg), "[%d] Stopped    %s", job_counter, bg_processes[bg_job_count - 1].command);
+            add_text_to_buffer(active_tab, job_msg);
+        }
+
+        active_tab->foreground_pid = -1;
+        printf("Stopped process %d and added to background jobs\n", active_tab->foreground_pid);
+    }
 }
 
 // Add this function before main()
@@ -2622,7 +3370,7 @@ int main()
     int screen;
     GC gc;
     // Set up cleanup on exit
-    atexit(cleanup_resources_default);
+    // atexit(cleanup_resources_default);
 
     if (signal(SIGINT, handle_sigint) == SIG_ERR)
     {
@@ -2632,8 +3380,17 @@ int main()
     {
         fprintf(stderr, "Warning: Failed to set SIGTSTP handler\n");
     }
+    if (signal(SIGSEGV, handle_sigsegv) == SIG_ERR)
+    {
+        fprintf(stderr, "Warning: Failed to set SIGSEGV handler\n");
+    }
 
     initialize_text_buffer();
+
+    // Initialize background jobs array
+    memset(bg_processes, 0, sizeof(bg_processes));
+    job_counter = 0;
+    bg_job_count = 0;
 
     display = XOpenDisplay(NULL);
     if (display == NULL)
@@ -2791,6 +3548,7 @@ int main()
                     active_tab->foreground_pid = -1;
                 }
             }
+
             which_signal = 0;
         }
 
