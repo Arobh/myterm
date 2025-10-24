@@ -18,7 +18,7 @@
 #include <wchar.h>
 #include <wctype.h>
 
-#define UTF8_BUFFER_SIZE (BUFFER_COLS * 4)  // UTF-8 can be up to 4 bytes per char
+#define UTF8_BUFFER_SIZE (BUFFER_COLS * 4) // UTF-8 can be up to 4 bytes per char
 
 #define MAX_MULTIWATCH_COMMANDS 10
 #define MULTIWATCH_BUFFER_SIZE 1024
@@ -35,7 +35,8 @@
 #define MAX_HISTORY_SIZE 10000
 
 
-typedef struct {
+typedef struct
+{
     pid_t pid;
     int fd;
     char command[MAX_COMMAND_LENGTH];
@@ -83,6 +84,83 @@ void add_text_to_buffer(Tab *tab, const char *text);
 void handle_multiwatch_command(Display *display, Window window, GC gc, Tab *tab, const char *command);
 void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *tab);
 void cleanup_multiwatch();
+
+// Default cleanup if main doesn't run properly
+void cleanup_resources_default(void)
+{
+    // Basic cleanup without display resources
+    cleanup_multiwatch();
+
+    // Kill any remaining processes
+    for (int i = 0; i < tab_count; i++)
+    {
+        if (tabs[i].foreground_pid > 0)
+        {
+            kill(tabs[i].foreground_pid, SIGKILL);
+        }
+    }
+}
+void cleanup_resources(Display *display, Window window, GC gc)
+{
+    printf("Cleaning up resources...\n");
+
+    // Cleanup multiwatch first
+    cleanup_multiwatch();
+
+    // Kill any running processes in tabs
+    for (int i = 0; i < tab_count; i++)
+    {
+        if (tabs[i].foreground_pid > 0)
+        {
+            printf("Killing process in tab %d: %d\n", i, tabs[i].foreground_pid);
+            kill(tabs[i].foreground_pid, SIGTERM);
+            // Give process a chance to clean up
+            usleep(50000);
+            int status;
+            if (waitpid(tabs[i].foreground_pid, &status, WNOHANG) == 0)
+            {
+                // Still running, force kill
+                kill(tabs[i].foreground_pid, SIGKILL);
+                waitpid(tabs[i].foreground_pid, &status, 0);
+            }
+            tabs[i].foreground_pid = -1;
+        }
+    }
+
+    // Cleanup X11 resources
+    if (gc)
+        XFreeGC(display, gc);
+    if (window)
+        XDestroyWindow(display, window);
+    if (display)
+        XCloseDisplay(display);
+
+    printf("Cleanup completed.\n");
+}
+
+// Safe command validation function
+int is_safe_command(const char *command)
+{
+    if (!command)
+        return 0;
+
+    // Basic checks for obviously dangerous patterns
+    const char *dangerous_patterns[] = {
+        ";;", "&&", "||", "`", "$(", "> /dev/", "> /proc/", 
+    "| tee", "> /etc/", "> /boot/", ">> /etc/", "sudo", 
+    "chmod 777", "chown root", NULL
+    };
+
+    for (int i = 0; dangerous_patterns[i] != NULL; i++)
+    {
+        if (strstr(command, dangerous_patterns[i]) != NULL)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
 
 // Add this function
 void close_current_tab()
@@ -136,7 +214,7 @@ void create_new_tab()
         new_tab->search_mode = 0;
         new_tab->search_pos = 0;
         memset(new_tab->search_buffer, 0, MAX_COMMAND_LENGTH);
-        strncpy(new_tab->tab_name, tab_name, MAX_TAB_NAME - 1);
+        snprintf(new_tab->tab_name, MAX_TAB_NAME, "%s", tab_name);
         new_tab->tab_name[MAX_TAB_NAME - 1] = '\0';
         new_tab->active = 0;
 
@@ -247,16 +325,23 @@ void add_text_to_buffer(Tab *tab, const char *text)
     if (!tab || !text)
         return;
 
-    // Convert UTF-8 to wide characters
+    // Convert UTF-8 to wide characters safely
     wchar_t wide_buffer[OUTPUT_BUFFER_SIZE];
     memset(wide_buffer, 0, sizeof(wide_buffer));
-    
+
     size_t converted = mbstowcs(wide_buffer, text, OUTPUT_BUFFER_SIZE - 1);
-    if (converted == (size_t)-1) {
+    if (converted == (size_t)-1)
+    {
         // Conversion failed, use simple ASCII fallback
-        for (int i = 0; text[i] != '\0' && i < OUTPUT_BUFFER_SIZE - 1; i++) {
-            wide_buffer[i] = (wchar_t)text[i];
+        for (int i = 0; text[i] != '\0' && i < OUTPUT_BUFFER_SIZE - 1; i++)
+        {
+            wide_buffer[i] = (wchar_t)(unsigned char)text[i];
         }
+        wide_buffer[OUTPUT_BUFFER_SIZE - 1] = L'\0';
+    }
+    else
+    {
+        wide_buffer[converted] = L'\0';
     }
 
     wchar_t *line = wide_buffer;
@@ -268,6 +353,14 @@ void add_text_to_buffer(Tab *tab, const char *text)
         if (newline)
         {
             *newline = L'\0';
+        }
+
+        // Bounds checking for cursor position
+        if (tab->cursor_row < 0)
+            tab->cursor_row = 0;
+        if (tab->cursor_row >= BUFFER_ROWS)
+        {
+            scroll_buffer(tab);
         }
 
         if (tab->cursor_row >= BUFFER_ROWS - 1)
@@ -290,6 +383,11 @@ void add_text_to_buffer(Tab *tab, const char *text)
             for (int i = 0; i < copy_len && i < BUFFER_COLS; i++)
             {
                 tab->text_buffer[tab->cursor_row][i] = line[i];
+            }
+            // Ensure the rest of the line is spaces
+            for (int i = copy_len; i < BUFFER_COLS; i++)
+            {
+                tab->text_buffer[tab->cursor_row][i] = L' ';
             }
         }
 
@@ -321,7 +419,6 @@ void update_command_display(Tab *tab)
     tab->cursor_col = 2 + tab->cursor_buffer_pos;
 }
 
-// Function to handle Tab key auto-completion
 void handle_tab_completion(Tab *tab)
 {
     // Get the current word being typed (from last space to cursor)
@@ -339,8 +436,17 @@ void handle_tab_completion(Tab *tab)
         return; // No word to complete
     }
 
+    // Convert wide char to multibyte for directory operations
     char current_word[MAX_COMMAND_LENGTH];
-    strncpy(current_word, &tab->current_command[word_start], word_length);
+    size_t converted = wcstombs(current_word, &tab->current_command[word_start], word_length);
+    if (converted == (size_t)-1)
+    {
+        // Fallback to ASCII
+        for (int i = 0; i < word_length && i < MAX_COMMAND_LENGTH - 1; i++)
+        {
+            current_word[i] = (char)tab->current_command[word_start + i];
+        }
+    }
     current_word[word_length] = '\0';
 
     // Scan current directory for matches
@@ -366,13 +472,16 @@ void handle_tab_completion(Tab *tab)
         // Check if this entry matches our current word
         if (strncmp(entry->d_name, current_word, word_length) == 0)
         {
-            strcpy(matches[match_count], entry->d_name);
+            if (snprintf(matches[match_count], MAX_COMMAND_LENGTH, "%s", entry->d_name) >= MAX_COMMAND_LENGTH)
+            {
+                continue; // Skip if filename too long
+            }
             match_count++;
 
             // Build common prefix
             if (match_count == 1)
             {
-                strcpy(common_prefix, entry->d_name);
+                snprintf(common_prefix, MAX_COMMAND_LENGTH, "%s", entry->d_name);
             }
             else
             {
@@ -408,7 +517,7 @@ void handle_tab_completion(Tab *tab)
         {
             if (word_start + i < MAX_COMMAND_LENGTH - 1)
             {
-                tab->current_command[word_start + i] = completion[i];
+                tab->current_command[word_start + i] = (wchar_t)completion[i];
             }
         }
 
@@ -416,17 +525,17 @@ void handle_tab_completion(Tab *tab)
         int new_length = word_start + completion_len;
         if (new_length < MAX_COMMAND_LENGTH)
         {
-            tab->current_command[new_length] = '\0';
+            tab->current_command[new_length] = L'\0';
             tab->command_length = new_length;
             tab->cursor_buffer_pos = new_length;
         }
 
         // Add space after completion if it's not the end of line
-        if (tab->cursor_buffer_pos < MAX_COMMAND_LENGTH - 1 && tab->current_command[tab->cursor_buffer_pos] == '\0')
+        if (tab->cursor_buffer_pos < MAX_COMMAND_LENGTH - 1 && tab->current_command[tab->cursor_buffer_pos] == L'\0')
         {
-            tab->current_command[tab->cursor_buffer_pos] = ' ';
+            tab->current_command[tab->cursor_buffer_pos] = L' ';
             tab->command_length++;
-            tab->current_command[tab->command_length] = '\0';
+            tab->current_command[tab->command_length] = L'\0';
             tab->cursor_buffer_pos++;
         }
     }
@@ -444,7 +553,7 @@ void handle_tab_completion(Tab *tab)
             {
                 if (word_start + i < MAX_COMMAND_LENGTH - 1)
                 {
-                    tab->current_command[word_start + i] = completion[i];
+                    tab->current_command[word_start + i] = (wchar_t)completion[i];
                 }
             }
 
@@ -452,7 +561,7 @@ void handle_tab_completion(Tab *tab)
             int new_length = word_start + completion_len;
             if (new_length < MAX_COMMAND_LENGTH)
             {
-                tab->current_command[new_length] = '\0';
+                tab->current_command[new_length] = L'\0';
                 tab->command_length = new_length;
                 tab->cursor_buffer_pos = new_length;
             }
@@ -462,34 +571,37 @@ void handle_tab_completion(Tab *tab)
         printf("\n");                // New line in console
         add_text_to_buffer(tab, ""); // Add blank line in X11 display
 
-        // Display matches in columns (simple formatting)
+        // Display matches in columns (safe formatting)
         char match_line[BUFFER_COLS] = {0};
-        int line_pos = 0;
+        size_t current_len = 0;
 
         for (int i = 0; i < match_count; i++)
         {
             int match_len = strlen(matches[i]);
+            int needed = match_len + 2; // space for match and separator
 
-            // Check if this match fits on current line
-            if (line_pos + match_len + 2 > BUFFER_COLS)
+            if (current_len + needed >= BUFFER_COLS)
             {
+                // Output current line and start new one
                 add_text_to_buffer(tab, match_line);
                 match_line[0] = '\0';
-                line_pos = 0;
+                current_len = 0;
             }
 
-            // Add match to line
-            if (line_pos > 0)
+            if (current_len > 0)
             {
-                strcat(match_line, "  ");
-                line_pos += 2;
+                // Safe concatenation
+                snprintf(match_line + current_len, sizeof(match_line) - current_len, "  ");
+                current_len += 2;
             }
-            strcat(match_line, matches[i]);
-            line_pos += match_len;
+
+            // Safe concatenation of match
+            snprintf(match_line + current_len, sizeof(match_line) - current_len, "%s", matches[i]);
+            current_len += match_len;
         }
 
         // Add remaining matches
-        if (line_pos > 0)
+        if (current_len > 0)
         {
             add_text_to_buffer(tab, match_line);
         }
@@ -510,9 +622,11 @@ void add_to_history(Tab *tab, const char *command)
     // Convert to wide characters for storage
     wchar_t wide_command[MAX_COMMAND_LENGTH];
     size_t converted = mbstowcs(wide_command, command, MAX_COMMAND_LENGTH - 1);
-    if (converted == (size_t)-1) {
+    if (converted == (size_t)-1)
+    {
         // Fallback to ASCII
-        for (int i = 0; command[i] != '\0' && i < MAX_COMMAND_LENGTH - 1; i++) {
+        for (int i = 0; command[i] != '\0' && i < MAX_COMMAND_LENGTH - 1; i++)
+        {
             wide_command[i] = (wchar_t)command[i];
         }
         wide_command[strlen(command)] = L'\0';
@@ -592,9 +706,11 @@ void update_command_display_with_prompt(Tab *tab, const char *prompt)
     // Convert prompt to wide characters
     wchar_t wide_prompt[BUFFER_COLS];
     size_t converted = mbstowcs(wide_prompt, prompt, BUFFER_COLS - 1);
-    if (converted == (size_t)-1) {
+    if (converted == (size_t)-1)
+    {
         // Fallback to ASCII
-        for (int i = 0; prompt[i] != '\0' && i < BUFFER_COLS - 1; i++) {
+        for (int i = 0; prompt[i] != '\0' && i < BUFFER_COLS - 1; i++)
+        {
             wide_prompt[i] = (wchar_t)prompt[i];
         }
         wide_prompt[BUFFER_COLS - 1] = L'\0';
@@ -629,7 +745,7 @@ void initialize_tab(Tab *tab, const char *name)
     tab->search_mode = 0;
     tab->search_pos = 0;
     memset(tab->search_buffer, 0, MAX_COMMAND_LENGTH * sizeof(wchar_t));
-    strncpy(tab->tab_name, name, MAX_TAB_NAME - 1);
+    snprintf(tab->tab_name, MAX_TAB_NAME, "%s", name);
     tab->tab_name[MAX_TAB_NAME - 1] = '\0';
 
     for (int row = 0; row < BUFFER_ROWS; row++)
@@ -706,12 +822,15 @@ void draw_text_buffer(Display *display, Window window, GC gc)
         if (x_start < 0 || x_start >= BUFFER_COLS)
             continue;
 
-        if (i == active_tab_index) {
+        if (i == active_tab_index)
+        {
             XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
-            XFillRectangle(display, window, gc, x_start * CHAR_WIDTH, 0, 
-                          tab_width * CHAR_WIDTH, CHAR_HEIGHT);
+            XFillRectangle(display, window, gc, x_start * CHAR_WIDTH, 0,
+                           tab_width * CHAR_WIDTH, CHAR_HEIGHT);
             XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
-        } else {
+        }
+        else
+        {
             XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
             XFillRectangle(display, window, gc, x_start * CHAR_WIDTH, 0,
                            tab_width * CHAR_WIDTH, CHAR_HEIGHT);
@@ -724,7 +843,7 @@ void draw_text_buffer(Display *display, Window window, GC gc)
         if (max_chars > MAX_TAB_NAME - 1)
             max_chars = MAX_TAB_NAME - 1;
 
-        strncpy(tab_display, tabs[i].tab_name, max_chars);
+        snprintf(tab_display, max_chars + 1, "%s", tabs[i].tab_name);
         tab_display[max_chars] = '\0';
 
         XDrawString(display, window, gc,
@@ -753,10 +872,13 @@ void draw_text_buffer(Display *display, Window window, GC gc)
                     // Convert wide character to multibyte for X11
                     char mb_char[MB_CUR_MAX + 1];
                     int len = wctomb(mb_char, active_tab->text_buffer[row][col]);
-                    if (len > 0) {
+                    if (len > 0)
+                    {
                         mb_char[len] = '\0';
                         XDrawString(display, window, gc, x, y, mb_char, len);
-                    } else {
+                    }
+                    else
+                    {
                         // Fallback for invalid characters
                         char temp_str[2] = {'?', '\0'};
                         XDrawString(display, window, gc, x, y, temp_str, 1);
@@ -782,36 +904,50 @@ void draw_text_buffer(Display *display, Window window, GC gc)
 void cleanup_multiwatch()
 {
     printf("Cleaning up multiWatch processes\n");
-    
-    for (int i = 0; i < multiwatch_count; i++) {
-        if (multiwatch_processes[i].active) {
+
+    for (int i = 0; i < multiwatch_count; i++)
+    {
+        if (multiwatch_processes[i].active)
+        {
             printf("Killing process %d\n", multiwatch_processes[i].pid);
-            
-            // Kill the process
-            kill(multiwatch_processes[i].pid, SIGTERM);
-            
-            // Wait for it to terminate
+
+            // Kill the process group to catch any child processes
+            kill(-multiwatch_processes[i].pid, SIGTERM);
+
+            // Wait for termination with timeout
             int status;
-            pid_t result = waitpid(multiwatch_processes[i].pid, &status, WNOHANG);
-            if (result == 0) {
-                // Process still running, force kill
+            int wait_timeout = 0;
+            while (waitpid(multiwatch_processes[i].pid, &status, WNOHANG) == 0 && wait_timeout < 10)
+            {
                 usleep(100000); // 100ms
-                kill(multiwatch_processes[i].pid, SIGKILL);
+                wait_timeout++;
+            }
+
+            // Force kill if still running
+            if (waitpid(multiwatch_processes[i].pid, &status, WNOHANG) == 0)
+            {
+                kill(-multiwatch_processes[i].pid, SIGKILL);
                 waitpid(multiwatch_processes[i].pid, &status, 0);
             }
-            
+
             // Close file descriptor
-            if (multiwatch_processes[i].fd != -1) {
+            if (multiwatch_processes[i].fd != -1)
+            {
                 close(multiwatch_processes[i].fd);
+                multiwatch_processes[i].fd = -1;
             }
-            
+
             // Remove temporary file
-            if (unlink(multiwatch_processes[i].temp_file) == 0) {
+            if (unlink(multiwatch_processes[i].temp_file) == 0)
+            {
                 printf("Removed temp file: %s\n", multiwatch_processes[i].temp_file);
-            } else {
-                printf("Failed to remove temp file: %s\n", multiwatch_processes[i].temp_file);
             }
-            
+            else if (errno != ENOENT)
+            {
+                printf("Failed to remove temp file: %s: %s\n",
+                       multiwatch_processes[i].temp_file, strerror(errno));
+            }
+
             multiwatch_processes[i].active = 0;
         }
     }
@@ -827,70 +963,84 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
     int active_count = multiwatch_count;
     int max_attempts = 50; // Try to read output for up to 5 seconds
     int attempts = 0;
-    
+
     printf("Starting to monitor %d processes\n", active_count);
-    
-    while ((active_count > 0 || attempts < max_attempts) && multiwatch_mode) {
+
+    while ((active_count > 0 || attempts < max_attempts) && multiwatch_mode)
+    {
         // Initialize poll structures
         int poll_count = 0;
-        for (int i = 0; i < multiwatch_count; i++) {
-            if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1) {
+        for (int i = 0; i < multiwatch_count; i++)
+        {
+            if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1)
+            {
                 fds[poll_count].fd = multiwatch_processes[i].fd;
                 fds[poll_count].events = POLLIN;
                 fds[poll_count].revents = 0;
                 poll_count++;
             }
         }
-        
+
         // Always try to read from files, even if poll times out
         // This catches output from processes that finished quickly
         int data_read = 0;
-        
+
         // Try to read from all file descriptors
-        for (int i = 0; i < multiwatch_count; i++) {
-            if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1) {
+        for (int i = 0; i < multiwatch_count; i++)
+        {
+            if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1)
+            {
                 ssize_t bytes_read = read(multiwatch_processes[i].fd, buffer, sizeof(buffer) - 1);
-                if (bytes_read > 0) {
+                if (bytes_read > 0)
+                {
                     data_read = 1;
                     buffer[bytes_read] = '\0';
-                    
+
                     // Add timestamp and command name
                     time_t now = time(NULL);
                     struct tm *tm_info = localtime(&now);
                     char timestamp[64];
                     strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
-                    
+
                     // Split output by lines and add each line
                     char *line = buffer;
                     char *newline;
-                    
-                    do {
+
+                    do
+                    {
                         newline = strchr(line, '\n');
-                        if (newline) {
+                        if (newline)
+                        {
                             *newline = '\0';
                         }
-                        
-                        if (strlen(line) > 0) {
+
+                        if (strlen(line) > 0)
+                        {
                             char output_line[BUFFER_COLS];
-                            snprintf(output_line, sizeof(output_line), "[%s] %s: %s", 
-                                    timestamp, multiwatch_processes[i].command, line);
-                            
+                            snprintf(output_line, sizeof(output_line), "[%s] %s: %s",
+                                     timestamp, multiwatch_processes[i].command, line);
+
                             add_text_to_buffer(tab, output_line);
                             printf("Output: %s\n", output_line);
                         }
-                        
-                        if (newline) {
+
+                        if (newline)
+                        {
                             line = newline + 1;
                         }
                     } while (newline);
-                    
+
                     draw_text_buffer(display, window, gc);
-                } else if (bytes_read == 0) {
+                }
+                else if (bytes_read == 0)
+                {
                     // EOF reached
                     printf("EOF for process %d\n", multiwatch_processes[i].pid);
                     close(multiwatch_processes[i].fd);
                     multiwatch_processes[i].fd = -1;
-                } else if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                }
+                else if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                {
                     // Read error
                     printf("Read error for process %d: %s\n", multiwatch_processes[i].pid, strerror(errno));
                     close(multiwatch_processes[i].fd);
@@ -898,51 +1048,61 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
                 }
             }
         }
-        
+
         // Also use poll for efficient waiting when no immediate data
-        if (poll_count > 0 && !data_read) {
+        if (poll_count > 0 && !data_read)
+        {
             int ret = poll(fds, poll_count, 100); // 100ms timeout
-            
-            if (ret > 0) {
+
+            if (ret > 0)
+            {
                 // Check for data on file descriptors that poll indicated are ready
                 int fd_index = 0;
-                for (int i = 0; i < multiwatch_count; i++) {
-                    if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1) {
-                        if (fds[fd_index].revents & POLLIN) {
+                for (int i = 0; i < multiwatch_count; i++)
+                {
+                    if (multiwatch_processes[i].active && multiwatch_processes[i].fd != -1)
+                    {
+                        if (fds[fd_index].revents & POLLIN)
+                        {
                             ssize_t bytes_read = read(multiwatch_processes[i].fd, buffer, sizeof(buffer) - 1);
-                            if (bytes_read > 0) {
+                            if (bytes_read > 0)
+                            {
                                 buffer[bytes_read] = '\0';
-                                
+
                                 // Add timestamp and command name
                                 time_t now = time(NULL);
                                 struct tm *tm_info = localtime(&now);
                                 char timestamp[64];
                                 strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
-                                
+
                                 // Split output by lines and add each line
                                 char *line = buffer;
                                 char *newline;
-                                
-                                do {
+
+                                do
+                                {
                                     newline = strchr(line, '\n');
-                                    if (newline) {
+                                    if (newline)
+                                    {
                                         *newline = '\0';
                                     }
-                                    
-                                    if (strlen(line) > 0) {
+
+                                    if (strlen(line) > 0)
+                                    {
                                         char output_line[BUFFER_COLS];
-                                        snprintf(output_line, sizeof(output_line), "[%s] %s: %s", 
-                                                timestamp, multiwatch_processes[i].command, line);
-                                        
+                                        snprintf(output_line, sizeof(output_line), "[%s] %s: %s",
+                                                 timestamp, multiwatch_processes[i].command, line);
+
                                         add_text_to_buffer(tab, output_line);
                                         printf("Poll Output: %s\n", output_line);
                                     }
-                                    
-                                    if (newline) {
+
+                                    if (newline)
+                                    {
                                         line = newline + 1;
                                     }
                                 } while (newline);
-                                
+
                                 draw_text_buffer(display, window, gc);
                             }
                         }
@@ -951,88 +1111,105 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
                 }
             }
         }
-        
+
         // Check process status and update active_count
         active_count = 0;
-        for (int i = 0; i < multiwatch_count; i++) {
-            if (multiwatch_processes[i].active) {
+        for (int i = 0; i < multiwatch_count; i++)
+        {
+            if (multiwatch_processes[i].active)
+            {
                 int status;
                 pid_t result = waitpid(multiwatch_processes[i].pid, &status, WNOHANG);
-                if (result == multiwatch_processes[i].pid) {
+                if (result == multiwatch_processes[i].pid)
+                {
                     // Process finished
                     printf("Process %d finished with status %d\n", multiwatch_processes[i].pid, WEXITSTATUS(status));
                     multiwatch_processes[i].active = 0;
-                    if (multiwatch_processes[i].fd != -1) {
+                    if (multiwatch_processes[i].fd != -1)
+                    {
                         close(multiwatch_processes[i].fd);
                         multiwatch_processes[i].fd = -1;
                     }
-                    
+
                     // Try to read any remaining output
                     char temp_buffer[1024];
                     int temp_fd = open(multiwatch_processes[i].temp_file, O_RDONLY);
-                    if (temp_fd != -1) {
+                    if (temp_fd != -1)
+                    {
                         ssize_t final_read = read(temp_fd, temp_buffer, sizeof(temp_buffer) - 1);
-                        if (final_read > 0) {
+                        if (final_read > 0)
+                        {
                             temp_buffer[final_read] = '\0';
                             time_t now = time(NULL);
                             struct tm *tm_info = localtime(&now);
                             char timestamp[64];
                             strftime(timestamp, sizeof(timestamp), "%H:%M:%S", tm_info);
-                            
+
                             char *line = temp_buffer;
                             char *newline;
-                            do {
+                            do
+                            {
                                 newline = strchr(line, '\n');
-                                if (newline) *newline = '\0';
-                                if (strlen(line) > 0) {
+                                if (newline)
+                                    *newline = '\0';
+                                if (strlen(line) > 0)
+                                {
                                     char output_line[BUFFER_COLS];
-                                    snprintf(output_line, sizeof(output_line), "[%s] %s: %s", 
-                                            timestamp, multiwatch_processes[i].command, line);
+                                    snprintf(output_line, sizeof(output_line), "[%s] %s: %s",
+                                             timestamp, multiwatch_processes[i].command, line);
                                     add_text_to_buffer(tab, output_line);
                                     printf("Final output: %s\n", output_line);
                                 }
-                                if (newline) line = newline + 1;
+                                if (newline)
+                                    line = newline + 1;
                             } while (newline);
                             draw_text_buffer(display, window, gc);
                         }
                         close(temp_fd);
                     }
-                    
+
                     char done_msg[128];
-                    snprintf(done_msg, sizeof(done_msg), 
-                            "Command '%s' finished", multiwatch_processes[i].command);
+                    snprintf(done_msg, sizeof(done_msg),
+                             "Command '%s' finished", multiwatch_processes[i].command);
                     add_text_to_buffer(tab, done_msg);
                     draw_text_buffer(display, window, gc);
-                    
-                } else if (result == 0) {
+                }
+                else if (result == 0)
+                {
                     // Process still running
                     active_count++;
-                } else {
+                }
+                else
+                {
                     // Error
                     printf("Error checking process %d: %s\n", multiwatch_processes[i].pid, strerror(errno));
                     multiwatch_processes[i].active = 0;
-                    if (multiwatch_processes[i].fd != -1) {
+                    if (multiwatch_processes[i].fd != -1)
+                    {
                         close(multiwatch_processes[i].fd);
                         multiwatch_processes[i].fd = -1;
                     }
                 }
             }
         }
-        
+
         attempts++;
-        
+
         // Check for user input or signals
         int has_events = 0;
-        while (XPending(display) > 0 && !has_events) {
+        while (XPending(display) > 0 && !has_events)
+        {
             XEvent ev;
             XNextEvent(display, &ev);
-            
-            if (ev.type == KeyPress) {
+
+            if (ev.type == KeyPress)
+            {
                 KeySym keysym;
                 char keybuf[256];
                 XLookupString(&ev.xkey, keybuf, sizeof(keybuf) - 1, &keysym, NULL);
-                
-                if ((ev.xkey.state & ControlMask) && keysym == XK_c) {
+
+                if ((ev.xkey.state & ControlMask) && keysym == XK_c)
+                {
                     printf("Ctrl+C detected in multiWatch\n");
                     add_text_to_buffer(tab, "Ctrl+C received - stopping multiWatch");
                     draw_text_buffer(display, window, gc);
@@ -1043,9 +1220,10 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
             }
             has_events = 1;
         }
-        
+
         // Check for signals
-        if (signal_received && which_signal == SIGINT) {
+        if (signal_received && which_signal == SIGINT)
+        {
             printf("SIGINT received in multiWatch\n");
             signal_received = 0;
             which_signal = 0;
@@ -1055,17 +1233,22 @@ void monitor_multiwatch_processes(Display *display, Window window, GC gc, Tab *t
             multiwatch_mode = 0;
             return;
         }
-        
+
         // If no processes are active but we haven't tried enough times, keep trying to read
-        if (active_count == 0 && attempts < max_attempts) {
+        if (active_count == 0 && attempts < max_attempts)
+        {
             usleep(100000); // 100ms delay
-        } else if (active_count == 0) {
+        }
+        else if (active_count == 0)
+        {
             break; // No active processes and we've tried enough times
-        } else {
+        }
+        else
+        {
             usleep(50000); // 50ms delay when processes are still active
         }
     }
-    
+
     printf("multiWatch monitoring finished after %d attempts\n", attempts);
     cleanup_multiwatch();
     multiwatch_mode = 0;
@@ -1079,195 +1262,234 @@ void handle_multiwatch_command(Display *display, Window window, GC gc, Tab *tab,
     // Parse commands from: multiWatch "cmd1" "cmd2" "cmd3"
     char commands[MAX_MULTIWATCH_COMMANDS][MAX_COMMAND_LENGTH];
     int cmd_count = 0;
-    
+
     char cmd_copy[MAX_COMMAND_LENGTH];
-    if (strncpy(cmd_copy, command, sizeof(cmd_copy) - 1) == NULL) {
+    // Safe copy
+    if (snprintf(cmd_copy, sizeof(cmd_copy), "%s", command) >= (int)sizeof(cmd_copy))
+    {
         add_text_to_buffer(tab, "Error: Command too long");
         draw_text_buffer(display, window, gc);
         return;
     }
-    cmd_copy[sizeof(cmd_copy) - 1] = '\0';
-    
+
     // Skip "multiWatch"
     char *ptr = cmd_copy + 10;
-    
+
     // Parse quoted commands
-    while (*ptr != '\0' && cmd_count < MAX_MULTIWATCH_COMMANDS) {
+    while (*ptr != '\0' && cmd_count < MAX_MULTIWATCH_COMMANDS)
+    {
         // Skip whitespace
-        while (*ptr == ' ') ptr++;
-        
-        if (*ptr == '"') {
+        while (*ptr == ' ')
+            ptr++;
+
+        if (*ptr == '"')
+        {
             ptr++; // Skip opening quote
             char *start = ptr;
-            
+
             // Find closing quote
-            while (*ptr != '"' && *ptr != '\0') ptr++;
-            
-            if (*ptr == '"') {
+            while (*ptr != '"' && *ptr != '\0')
+                ptr++;
+
+            if (*ptr == '"')
+            {
                 int len = ptr - start;
-                if (len > 0 && len < MAX_COMMAND_LENGTH - 1) {
-                    if (strncpy(commands[cmd_count], start, len) == NULL) {
+                if (len > 0 && len < MAX_COMMAND_LENGTH - 1)
+                {
+                    if (snprintf(commands[cmd_count], MAX_COMMAND_LENGTH, "%.*s", len, start) >= MAX_COMMAND_LENGTH)
+                    {
                         add_text_to_buffer(tab, "Error: Command too long");
                         draw_text_buffer(display, window, gc);
                         return;
                     }
-                    commands[cmd_count][len] = '\0';
                     cmd_count++;
                 }
                 ptr++; // Skip closing quote
-            } else {
+            }
+            else
+            {
                 add_text_to_buffer(tab, "Error: Unclosed quote in multiWatch command");
                 draw_text_buffer(display, window, gc);
                 return;
             }
-        } else {
+        }
+        else
+        {
             add_text_to_buffer(tab, "Error: Invalid multiWatch syntax - use: multiWatch \"cmd1\" \"cmd2\"");
             draw_text_buffer(display, window, gc);
             return;
         }
     }
-    
-    if (cmd_count == 0) {
+
+    if (cmd_count == 0)
+    {
         add_text_to_buffer(tab, "Usage: multiWatch \"command1\" \"command2\" ...");
         draw_text_buffer(display, window, gc);
         return;
     }
-    
-    if (cmd_count > MAX_MULTIWATCH_COMMANDS) {
+
+    if (cmd_count > MAX_MULTIWATCH_COMMANDS)
+    {
         char error_msg[256];
         snprintf(error_msg, sizeof(error_msg), "Error: Too many commands (max %d)", MAX_MULTIWATCH_COMMANDS);
         add_text_to_buffer(tab, error_msg);
         draw_text_buffer(display, window, gc);
         return;
     }
-    
+
     add_text_to_buffer(tab, "Starting multiWatch mode. Press Ctrl+C to stop.");
     draw_text_buffer(display, window, gc);
-    
+
     // Initialize multiwatch processes
     multiwatch_count = cmd_count;
     multiwatch_mode = 1;
-    
+
     int successful_forks = 0;
-    
+
     // Create temporary files and fork processes
-    for (int i = 0; i < cmd_count; i++) {
-        // Create temporary file first
-        if (snprintf(multiwatch_processes[i].temp_file, sizeof(multiwatch_processes[i].temp_file), 
-                 ".temp.multiwatch.%d.%d.txt", getpid(), i) >= (int)sizeof(multiwatch_processes[i].temp_file)) {
+    for (int i = 0; i < cmd_count; i++)
+    {
+        // Create secure temporary filename
+        if (snprintf(multiwatch_processes[i].temp_file,
+                     sizeof(multiwatch_processes[i].temp_file),
+                     ".temp.multiwatch.%d.%d.%d.txt",
+                     getpid(), i, (int)time(NULL)) >= (int)sizeof(multiwatch_processes[i].temp_file))
+        {
             printf("Warning: Temp filename too long for command %d\n", i);
             multiwatch_processes[i].active = 0;
             continue;
         }
-        
+
         // Create the file and close it (child will reopen)
-        int fd = open(multiwatch_processes[i].temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd == -1) {
+        int fd = open(multiwatch_processes[i].temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0600); // Secure permissions
+        if (fd == -1)
+        {
             printf("Error: Failed to create temp file %s: %s\n", multiwatch_processes[i].temp_file, strerror(errno));
             multiwatch_processes[i].active = 0;
             continue;
         }
-        if (close(fd) == -1) {
+        if (close(fd) == -1)
+        {
             printf("Warning: Failed to close temp file: %s\n", strerror(errno));
         }
-        
+
         pid_t pid = fork();
-        
-        if (pid == 0) {
+
+        if (pid == 0)
+        {
             // Child process
             signal(SIGINT, SIG_DFL);
             signal(SIGTERM, SIG_DFL);
-            
+
             // Redirect stdout to temporary file
-            int out_fd = open(multiwatch_processes[i].temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (out_fd == -1) {
+            int out_fd = open(multiwatch_processes[i].temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out_fd == -1)
+            {
                 fprintf(stderr, "Failed to open temp file: %s\n", strerror(errno));
                 exit(1);
             }
-            
-            if (dup2(out_fd, STDOUT_FILENO) == -1) {
+
+            if (dup2(out_fd, STDOUT_FILENO) == -1)
+            {
                 fprintf(stderr, "Failed to redirect stdout: %s\n", strerror(errno));
                 close(out_fd);
                 exit(1);
             }
-            if (dup2(out_fd, STDERR_FILENO) == -1) {
+            if (dup2(out_fd, STDERR_FILENO) == -1)
+            {
                 fprintf(stderr, "Failed to redirect stderr: %s\n", strerror(errno));
                 close(out_fd);
                 exit(1);
             }
-            if (close(out_fd) == -1) {
+            if (close(out_fd) == -1)
+            {
                 fprintf(stderr, "Failed to close temp file: %s\n", strerror(errno));
             }
-            
+
             // Parse and execute the command
             char *args[64];
             int arg_count = 0;
             char cmd_buffer[MAX_COMMAND_LENGTH];
-            
-            if (strncpy(cmd_buffer, commands[i], sizeof(cmd_buffer) - 1) == NULL) {
+
+            // Safe copy
+            if (snprintf(cmd_buffer, sizeof(cmd_buffer), "%s", commands[i]) >= (int)sizeof(cmd_buffer))
+            {
                 fprintf(stderr, "Error: Command too long\n");
                 exit(1);
             }
-            cmd_buffer[sizeof(cmd_buffer) - 1] = '\0';
-            
+
             // For commands with pipes, we need to handle them differently
-            if (strstr(commands[i], "|") != NULL) {
+            if (strstr(commands[i], "|") != NULL)
+            {
                 // Handle piped commands by executing through shell
                 execl("/bin/sh", "sh", "-c", commands[i], NULL);
                 fprintf(stderr, "Failed to execute shell: %s\n", strerror(errno));
-            } else {
+            }
+            else
+            {
                 // Regular command - tokenize and execute directly
                 char *token = strtok(cmd_buffer, " ");
-                while (token != NULL && arg_count < 63) {
+                while (token != NULL && arg_count < 63)
+                {
                     args[arg_count++] = token;
                     token = strtok(NULL, " ");
                 }
                 args[arg_count] = NULL;
-                
-                if (arg_count == 0) {
+
+                if (arg_count == 0)
+                {
                     fprintf(stderr, "Error: Empty command\n");
                     exit(1);
                 }
-                
+
                 // Execute the command
                 execvp(args[0], args);
                 fprintf(stderr, "Failed to execute %s: %s\n", args[0], strerror(errno));
             }
             exit(127);
-        } else if (pid > 0) {
+        }
+        else if (pid > 0)
+        {
             // Parent process
             multiwatch_processes[i].pid = pid;
-            if (strncpy(multiwatch_processes[i].command, commands[i], MAX_COMMAND_LENGTH - 1) == NULL) {
+            // Safe copy of command name
+            if (snprintf(multiwatch_processes[i].command, MAX_COMMAND_LENGTH, "%s", commands[i]) >= MAX_COMMAND_LENGTH)
+            {
                 printf("Warning: Command name too long, truncating\n");
             }
-            multiwatch_processes[i].command[MAX_COMMAND_LENGTH - 1] = '\0';
             multiwatch_processes[i].active = 1;
-            
+
             // Open the file for reading (non-blocking)
             multiwatch_processes[i].fd = open(multiwatch_processes[i].temp_file, O_RDONLY | O_NONBLOCK);
-            if (multiwatch_processes[i].fd == -1) {
+            if (multiwatch_processes[i].fd == -1)
+            {
                 printf("Failed to open temp file for reading: %s: %s\n", multiwatch_processes[i].temp_file, strerror(errno));
                 multiwatch_processes[i].active = 0;
-            } else {
+            }
+            else
+            {
                 successful_forks++;
             }
-            
+
             printf("Started process %d for: %s\n", pid, commands[i]);
-        } else {
+        }
+        else
+        {
             // Fork failed
             printf("Fork failed for command '%s': %s\n", commands[i], strerror(errno));
             multiwatch_processes[i].active = 0;
         }
     }
-    
-    if (successful_forks == 0) {
+
+    if (successful_forks == 0)
+    {
         add_text_to_buffer(tab, "Error: Failed to start any multiWatch processes");
         cleanup_multiwatch();
         multiwatch_mode = 0;
         draw_text_buffer(display, window, gc);
         return;
     }
-    
+
     // Start monitoring
     monitor_multiwatch_processes(display, window, gc, tab);
 }
@@ -1280,19 +1502,27 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         add_text_to_buffer(tab, "");
         return;
     }
-
-    // Check for multiWatch command first
-    if (strncmp(command, "multiWatch", 10) == 0) {
-        handle_multiwatch_command(display, window, gc, tab, command);
+    // Add security validation
+    if (!is_safe_command(command))
+    {
+        add_text_to_buffer(tab, "Error: Command contains potentially unsafe patterns");
         return;
     }
 
+    // Safe command validation
     char command_copy[MAX_COMMAND_LENGTH];
-    if (strncpy(command_copy, command, sizeof(command_copy) - 1) == NULL) {
+    if (snprintf(command_copy, sizeof(command_copy), "%s", command) >= (int)sizeof(command_copy))
+    {
         add_text_to_buffer(tab, "Error: Command too long");
         return;
     }
-    command_copy[sizeof(command_copy) - 1] = '\0';
+
+    // Check for multiWatch command first
+    if (strncmp(command, "multiWatch", 10) == 0)
+    {
+        handle_multiwatch_command(display, window, gc, tab, command);
+        return;
+    }
 
     char *args[64];
     int arg_count = 0;
@@ -1346,7 +1576,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
     char *commands[16];
     char command_copy2[MAX_COMMAND_LENGTH];
 
-    if (strncpy(command_copy2, command, sizeof(command_copy2) - 1) == NULL) {
+    if (snprintf(command_copy2, sizeof(command_copy2), "%s", command) >= (int)sizeof(command_copy2))
+    {
         add_text_to_buffer(tab, "Error: Command too long");
         return;
     }
@@ -1388,19 +1619,23 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             signal(SIGINT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL);
 
-            if (close(pipefd[0]) == -1) {
+            if (close(pipefd[0]) == -1)
+            {
                 perror("close pipefd[0] failed");
             }
-            
-            if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
+
+            if (dup2(pipefd[1], STDOUT_FILENO) == -1)
+            {
                 perror("dup2 stdout failed");
                 exit(1);
             }
-            if (dup2(pipefd[1], STDERR_FILENO) == -1) {
+            if (dup2(pipefd[1], STDERR_FILENO) == -1)
+            {
                 perror("dup2 stderr failed");
                 exit(1);
             }
-            if (close(pipefd[1]) == -1) {
+            if (close(pipefd[1]) == -1)
+            {
                 perror("close pipefd[1] failed");
             }
 
@@ -1410,7 +1645,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             char *output_file = NULL;
             char cmd_copy[MAX_COMMAND_LENGTH];
 
-            if (strncpy(cmd_copy, commands[0], sizeof(cmd_copy) - 1) == NULL) {
+            if (snprintf(cmd_copy, sizeof(cmd_copy), "%s", command) >= (int)sizeof(cmd_copy))
+            {
                 fprintf(stderr, "Error: Command too long\n");
                 exit(1);
             }
@@ -1447,7 +1683,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                     fprintf(stderr, "Error: Cannot open input file '%s': %s\n", input_file, strerror(errno));
                     exit(1);
                 }
-                if (dup2(fd, STDIN_FILENO) == -1) {
+                if (dup2(fd, STDIN_FILENO) == -1)
+                {
                     fprintf(stderr, "Error: Cannot redirect stdin: %s\n", strerror(errno));
                     close(fd);
                     exit(1);
@@ -1463,7 +1700,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                     fprintf(stderr, "Error: Cannot create output file '%s': %s\n", output_file, strerror(errno));
                     exit(1);
                 }
-                if (dup2(fd, STDOUT_FILENO) == -1) {
+                if (dup2(fd, STDOUT_FILENO) == -1)
+                {
                     fprintf(stderr, "Error: Cannot redirect stdout: %s\n", strerror(errno));
                     close(fd);
                     exit(1);
@@ -1471,7 +1709,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 close(fd);
             }
 
-            if (arg_count == 0) {
+            if (arg_count == 0)
+            {
                 fprintf(stderr, "Error: No command specified\n");
                 exit(1);
             }
@@ -1491,11 +1730,13 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             char full_output[OUTPUT_BUFFER_SIZE] = {0};
             int full_output_len = 0;
 
-            if (close(pipefd[1]) == -1) {
+            if (close(pipefd[1]) == -1)
+            {
                 printf("Warning: Failed to close pipe write end: %s\n", strerror(errno));
             }
-            
-            if (fcntl(pipefd[0], F_SETFL, O_NONBLOCK) == -1) {
+
+            if (fcntl(pipefd[0], F_SETFL, O_NONBLOCK) == -1)
+            {
                 printf("Warning: Failed to set non-blocking mode: %s\n", strerror(errno));
             }
 
@@ -1518,7 +1759,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                         if ((ev.xkey.state & ControlMask) && keysym == XK_c)
                         {
                             printf("\nCtrl+C detected - interrupting process\n");
-                            if (kill(pid, SIGINT) == -1) {
+                            if (kill(pid, SIGINT) == -1)
+                            {
                                 printf("Warning: Failed to send SIGINT: %s\n", strerror(errno));
                             }
                             break;
@@ -1526,7 +1768,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                         else if ((ev.xkey.state & ControlMask) && keysym == XK_z)
                         {
                             printf("\nCtrl+Z detected - stopping process\n");
-                            if (kill(pid, SIGTSTP) == -1) {
+                            if (kill(pid, SIGTSTP) == -1)
+                            {
                                 printf("Warning: Failed to send SIGTSTP: %s\n", strerror(errno));
                             }
                             break;
@@ -1540,7 +1783,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                     if (which_signal == SIGINT)
                     {
                         printf("\nCtrl+C received - interrupting process\n");
-                        if (kill(pid, SIGINT) == -1) {
+                        if (kill(pid, SIGINT) == -1)
+                        {
                             printf("Warning: Failed to send SIGINT: %s\n", strerror(errno));
                         }
                         break;
@@ -1548,7 +1792,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                     else if (which_signal == SIGTSTP)
                     {
                         printf("\nCtrl+Z received - stopping process\n");
-                        if (kill(pid, SIGTSTP) == -1) {
+                        if (kill(pid, SIGTSTP) == -1)
+                        {
                             printf("Warning: Failed to send SIGTSTP: %s\n", strerror(errno));
                         }
                         break;
@@ -1560,15 +1805,20 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 if (bytes_read > 0)
                 {
                     buffer[bytes_read] = '\0';
-                    if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1) {
+                    if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1)
+                    {
                         strncpy(full_output + full_output_len, buffer, bytes_read);
                         full_output_len += bytes_read;
                         full_output[full_output_len] = '\0';
-                    } else {
+                    }
+                    else
+                    {
                         add_text_to_buffer(tab, "Warning: Output truncated (too large)");
                         break;
                     }
-                } else if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                }
+                else if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                {
                     printf("Read error: %s\n", strerror(errno));
                     break;
                 }
@@ -1588,9 +1838,11 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 timeout_counter++;
             }
 
-            if (timeout_counter >= MAX_TIMEOUT) {
+            if (timeout_counter >= MAX_TIMEOUT)
+            {
                 add_text_to_buffer(tab, "Error: Command timed out");
-                if (kill(pid, SIGKILL) == -1) {
+                if (kill(pid, SIGKILL) == -1)
+                {
                     printf("Warning: Failed to kill timed out process: %s\n", strerror(errno));
                 }
             }
@@ -1599,22 +1851,27 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0)
             {
                 buffer[bytes_read] = '\0';
-                if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1) {
+                if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1)
+                {
                     strncpy(full_output + full_output_len, buffer, bytes_read);
                     full_output_len += bytes_read;
                     full_output[full_output_len] = '\0';
                 }
             }
 
-            if (close(pipefd[0]) == -1) {
+            if (close(pipefd[0]) == -1)
+            {
                 printf("Warning: Failed to close pipe read end: %s\n", strerror(errno));
             }
 
             // Wait for child to ensure no zombies
-            if (!child_exited) {
-                if (waitpid(pid, &status, WNOHANG) == 0) {
+            if (!child_exited)
+            {
+                if (waitpid(pid, &status, WNOHANG) == 0)
+                {
                     // Process still running, kill it
-                    if (kill(pid, SIGKILL) == -1) {
+                    if (kill(pid, SIGKILL) == -1)
+                    {
                         printf("Warning: Failed to kill process: %s\n", strerror(errno));
                     }
                     waitpid(pid, &status, 0);
@@ -1685,13 +1942,15 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 char error_msg[256];
                 snprintf(error_msg, sizeof(error_msg), "Error: Fork failed: %s", strerror(errno));
                 add_text_to_buffer(tab, error_msg);
-                
+
                 // Clean up: kill already forked processes
-                for (int j = 0; j < i; j++) {
+                for (int j = 0; j < i; j++)
+                {
                     kill(pids[j], SIGKILL);
                 }
                 // Close all pipes
-                for (int j = 0; j < num_commands - 1; j++) {
+                for (int j = 0; j < num_commands - 1; j++)
+                {
                     close(pipefds[j % 2][0]);
                     close(pipefds[j % 2][1]);
                 }
@@ -1708,7 +1967,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 // Set up input redirection
                 if (i > 0)
                 {
-                    if (dup2(pipefds[(i - 1) % 2][0], STDIN_FILENO) == -1) {
+                    if (dup2(pipefds[(i - 1) % 2][0], STDIN_FILENO) == -1)
+                    {
                         perror("dup2 stdin failed");
                         exit(1);
                     }
@@ -1717,22 +1977,26 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 // Set up output redirection
                 if (i < num_commands - 1)
                 {
-                    if (dup2(pipefds[i % 2][1], STDOUT_FILENO) == -1) {
+                    if (dup2(pipefds[i % 2][1], STDOUT_FILENO) == -1)
+                    {
                         perror("dup2 stdout failed");
                         exit(1);
                     }
-                    if (dup2(pipefds[i % 2][1], STDERR_FILENO) == -1) {
+                    if (dup2(pipefds[i % 2][1], STDERR_FILENO) == -1)
+                    {
                         perror("dup2 stderr failed");
                         exit(1);
                     }
                 }
                 else
                 {
-                    if (dup2(final_output_pipe[1], STDOUT_FILENO) == -1) {
+                    if (dup2(final_output_pipe[1], STDOUT_FILENO) == -1)
+                    {
                         perror("dup2 stdout failed");
                         exit(1);
                     }
-                    if (dup2(final_output_pipe[1], STDERR_FILENO) == -1) {
+                    if (dup2(final_output_pipe[1], STDERR_FILENO) == -1)
+                    {
                         perror("dup2 stderr failed");
                         exit(1);
                     }
@@ -1763,7 +2027,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                     end--;
                 }
 
-                if (strncpy(cmd_copy, cmd, sizeof(cmd_copy) - 1) == NULL) {
+                if (snprintf(cmd_copy, sizeof(cmd_copy), "%s", cmd) >= (int)sizeof(cmd_copy))
+                {
                     fprintf(stderr, "Error: Command too long\n");
                     exit(1);
                 }
@@ -1777,7 +2042,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 }
                 args[arg_count] = NULL;
 
-                if (arg_count == 0) {
+                if (arg_count == 0)
+                {
                     fprintf(stderr, "Error: No command specified\n");
                     exit(1);
                 }
@@ -1791,14 +2057,17 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         // Parent process: close all unused pipe ends
         for (i = 0; i < num_commands - 1; i++)
         {
-            if (close(pipefds[i % 2][0]) == -1) {
+            if (close(pipefds[i % 2][0]) == -1)
+            {
                 printf("Warning: Failed to close pipe read end: %s\n", strerror(errno));
             }
-            if (close(pipefds[i % 2][1]) == -1) {
+            if (close(pipefds[i % 2][1]) == -1)
+            {
                 printf("Warning: Failed to close pipe write end: %s\n", strerror(errno));
             }
         }
-        if (close(final_output_pipe[1]) == -1) {
+        if (close(final_output_pipe[1]) == -1)
+        {
             printf("Warning: Failed to close final output pipe write end: %s\n", strerror(errno));
         }
 
@@ -1810,7 +2079,8 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         char full_output[OUTPUT_BUFFER_SIZE] = {0};
         int full_output_len = 0;
 
-        if (fcntl(final_output_pipe[0], F_SETFL, O_NONBLOCK) == -1) {
+        if (fcntl(final_output_pipe[0], F_SETFL, O_NONBLOCK) == -1)
+        {
             printf("Warning: Failed to set non-blocking mode: %s\n", strerror(errno));
         }
 
@@ -1824,15 +2094,20 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             if (bytes_read > 0)
             {
                 buffer[bytes_read] = '\0';
-                if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1) {
+                if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1)
+                {
                     strncpy(full_output + full_output_len, buffer, bytes_read);
                     full_output_len += bytes_read;
                     full_output[full_output_len] = '\0';
-                } else {
+                }
+                else
+                {
                     add_text_to_buffer(tab, "Warning: Output truncated (too large)");
                     break;
                 }
-            } else if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            }
+            else if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            {
                 printf("Read error: %s\n", strerror(errno));
                 break;
             }
@@ -1843,7 +2118,9 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
                 if (waitpid(pids[i], &status, WNOHANG) == 0)
                 {
                     all_children_exited = 0;
-                } else if (waitpid(pids[i], &status, WNOHANG) == -1) {
+                }
+                else if (waitpid(pids[i], &status, WNOHANG) == -1)
+                {
                     printf("Waitpid error for process %d: %s\n", pids[i], strerror(errno));
                 }
             }
@@ -1852,10 +2129,13 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
             timeout_counter++;
         }
 
-        if (timeout_counter >= MAX_TIMEOUT) {
+        if (timeout_counter >= MAX_TIMEOUT)
+        {
             add_text_to_buffer(tab, "Error: Pipeline timed out");
-            for (i = 0; i < num_commands; i++) {
-                if (kill(pids[i], SIGKILL) == -1) {
+            for (i = 0; i < num_commands; i++)
+            {
+                if (kill(pids[i], SIGKILL) == -1)
+                {
                     printf("Warning: Failed to kill process %d: %s\n", pids[i], strerror(errno));
                 }
             }
@@ -1865,21 +2145,24 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
         while ((bytes_read = read(final_output_pipe[0], buffer, sizeof(buffer) - 1)) > 0)
         {
             buffer[bytes_read] = '\0';
-            if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1) {
+            if (full_output_len + bytes_read < OUTPUT_BUFFER_SIZE - 1)
+            {
                 strncpy(full_output + full_output_len, buffer, bytes_read);
                 full_output_len += bytes_read;
                 full_output[full_output_len] = '\0';
             }
         }
 
-        if (close(final_output_pipe[0]) == -1) {
+        if (close(final_output_pipe[0]) == -1)
+        {
             printf("Warning: Failed to close final output pipe read end: %s\n", strerror(errno));
         }
 
         // Wait for all children to ensure no zombies
         for (i = 0; i < num_commands; i++)
         {
-            if (waitpid(pids[i], NULL, 0) == -1) {
+            if (waitpid(pids[i], NULL, 0) == -1)
+            {
                 printf("Warning: Failed to wait for process %d: %s\n", pids[i], strerror(errno));
             }
         }
@@ -1900,23 +2183,30 @@ void execute_command(Display *display, Window window, GC gc, Tab *tab, const cha
 // Function to handle Enter key - executes command and shows output
 void handle_enter_key(Display *display, Window window, GC gc, Tab *tab)
 {
-    if (wcslen(tab->current_command) > 0) {
+    if (wcslen(tab->current_command) > 0)
+    {
         // Convert wide character command back to multibyte for execution
         char mb_command[MAX_COMMAND_LENGTH * 4];
         size_t converted = wcstombs(mb_command, tab->current_command, sizeof(mb_command) - 1);
-        if (converted == (size_t)-1) {
+        if (converted == (size_t)-1)
+        {
             // Conversion failed, use simple ASCII fallback
-            for (int i = 0; i < tab->command_length && i < sizeof(mb_command) - 1; i++) {
+            for (int i = 0; i < tab->command_length && i < sizeof(mb_command) - 1; i++)
+            {
                 mb_command[i] = (char)tab->current_command[i];
             }
             mb_command[tab->command_length] = '\0';
-        } else {
+        }
+        else
+        {
             mb_command[converted] = '\0';
         }
-        
+
         add_to_history(tab, mb_command);
         printf("ENTER pressed in tab %s - executing command: '%s'\n", tab->tab_name, mb_command);
-    } else {
+    }
+    else
+    {
         printf("ENTER pressed with empty command\n");
     }
 
@@ -1932,22 +2222,29 @@ void handle_enter_key(Display *display, Window window, GC gc, Tab *tab)
     }
     tab->cursor_col = 0;
 
-    if (wcslen(tab->current_command) > 0) {
+    if (wcslen(tab->current_command) > 0)
+    {
         // Convert to multibyte for execution
         char mb_command[MAX_COMMAND_LENGTH * 4];
         size_t converted = wcstombs(mb_command, tab->current_command, sizeof(mb_command) - 1);
-        if (converted == (size_t)-1) {
+        if (converted == (size_t)-1)
+        {
             // Fallback to ASCII
-            for (int i = 0; i < tab->command_length && i < sizeof(mb_command) - 1; i++) {
+            for (int i = 0; i < tab->command_length && i < sizeof(mb_command) - 1; i++)
+            {
                 mb_command[i] = (char)tab->current_command[i];
             }
             mb_command[tab->command_length] = '\0';
-        } else {
+        }
+        else
+        {
             mb_command[converted] = '\0';
         }
-        
+
         execute_command(display, window, gc, tab, mb_command);
-    } else {
+    }
+    else
+    {
         add_text_to_buffer(tab, "");
     }
 
@@ -1989,9 +2286,11 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
 
     // Convert input to wide character
     wchar_t wide_char = L'\0';
-    if (buffer_len > 0) {
+    if (buffer_len > 0)
+    {
         int converted = mbtowc(&wide_char, buffer, buffer_len);
-        if (converted == -1) {
+        if (converted == -1)
+        {
             wide_char = L'\0';
         }
     }
@@ -2255,16 +2554,18 @@ void handle_keypress(Display *display, Window window, GC gc, XKeyEvent *key_even
                     update_command_display(active_tab);
 
                     // Debug output - convert wide string to multibyte for printf
-                char mb_command[MAX_COMMAND_LENGTH * 4];
-                size_t converted = wcstombs(mb_command, active_tab->current_command, sizeof(mb_command) - 1);
-                if (converted == (size_t)-1) {
-                    // Fallback to ASCII
-                    for (int i = 0; i < active_tab->command_length && i < sizeof(mb_command) - 1; i++) {
-                        mb_command[i] = (char)active_tab->current_command[i];
+                    char mb_command[MAX_COMMAND_LENGTH * 4];
+                    size_t converted = wcstombs(mb_command, active_tab->current_command, sizeof(mb_command) - 1);
+                    if (converted == (size_t)-1)
+                    {
+                        // Fallback to ASCII
+                        for (int i = 0; i < active_tab->command_length && i < sizeof(mb_command) - 1; i++)
+                        {
+                            mb_command[i] = (char)active_tab->current_command[i];
+                        }
+                        mb_command[active_tab->command_length] = '\0';
                     }
-                    mb_command[active_tab->command_length] = '\0';
-                }
-                printf("Current command: '%s', cursor at: %d\n", mb_command, active_tab->cursor_buffer_pos);
+                    printf("Current command: '%s', cursor at: %d\n", mb_command, active_tab->cursor_buffer_pos);
                 }
             }
         }
@@ -2283,11 +2584,11 @@ void handle_sigint(int sig)
     signal_received = 1;
     which_signal = SIGINT;
 
-     // If in multiwatch mode, stop it
-    if (multiwatch_mode) {
-        cleanup_multiwatch();
-        multiwatch_mode = 0;
-    }
+    // If in multiwatch mode, stop it
+    // if (multiwatch_mode) {
+    //     cleanup_multiwatch();
+    //     multiwatch_mode = 0;
+    // }
 }
 
 void handle_sigtstp(int sig)
@@ -2297,10 +2598,11 @@ void handle_sigtstp(int sig)
 }
 
 // Add this function before main()
-static int x11_error_handler(Display *d, XErrorEvent *e) {
+static int x11_error_handler(Display *d, XErrorEvent *e)
+{
     char error_text[256];
     XGetErrorText(d, e->error_code, error_text, sizeof(error_text));
-    printf("X11 Error: %s (request code: %d, error code: %d)\n", 
+    printf("X11 Error: %s (request code: %d, error code: %d)\n",
            error_text, e->request_code, e->error_code);
     return 0;
 }
@@ -2309,7 +2611,8 @@ static int x11_error_handler(Display *d, XErrorEvent *e) {
 int main()
 {
     // Set locale for Unicode support
-    if (setlocale(LC_ALL, "") == NULL) {
+    if (setlocale(LC_ALL, "") == NULL)
+    {
         fprintf(stderr, "Warning: Failed to set locale\n");
     }
 
@@ -2318,11 +2621,15 @@ int main()
     XEvent event;
     int screen;
     GC gc;
+    // Set up cleanup on exit
+    atexit(cleanup_resources_default);
 
-    if (signal(SIGINT, handle_sigint) == SIG_ERR) {
+    if (signal(SIGINT, handle_sigint) == SIG_ERR)
+    {
         fprintf(stderr, "Warning: Failed to set SIGINT handler\n");
     }
-    if (signal(SIGTSTP, handle_sigtstp) == SIG_ERR) {
+    if (signal(SIGTSTP, handle_sigtstp) == SIG_ERR)
+    {
         fprintf(stderr, "Warning: Failed to set SIGTSTP handler\n");
     }
 
@@ -2350,20 +2657,22 @@ int main()
         BlackPixel(display, screen),
         WhitePixel(display, screen));
 
-    if (window == 0) {
+    if (window == 0)
+    {
         fprintf(stderr, "Error: Failed to create window\n");
         XCloseDisplay(display);
         exit(1);
     }
 
     gc = XCreateGC(display, window, 0, NULL);
-    if (gc == NULL) {
+    if (gc == NULL)
+    {
         fprintf(stderr, "Error: Failed to create graphics context\n");
         XDestroyWindow(display, window);
         XCloseDisplay(display);
         exit(1);
     }
-    
+
     XSetForeground(display, gc, BlackPixel(display, screen));
 
     XSelectInput(display, window,
@@ -2371,7 +2680,8 @@ int main()
 
     XMapWindow(display, window);
 
-    if (XStoreName(display, window, "X11 Shell with Tabs") == 0) {
+    if (XStoreName(display, window, "X11 Shell with Tabs") == 0)
+    {
         printf("Warning: Failed to set window title\n");
     }
 
@@ -2379,12 +2689,15 @@ int main()
     XSetErrorHandler(x11_error_handler);
 
     // Enable window close protocol
-Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
-if (wm_delete_window != None) {
-    XSetWMProtocols(display, window, &wm_delete_window, 1);
-} else {
-    printf("Warning: Failed to set window close protocol\n");
-}
+    Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    if (wm_delete_window != None)
+    {
+        XSetWMProtocols(display, window, &wm_delete_window, 1);
+    }
+    else
+    {
+        printf("Warning: Failed to set window close protocol\n");
+    }
 
     printf("Shell terminal with tabs created!\n");
     printf("Shortcuts: Ctrl+N=new tab, Ctrl+W=close tab, Ctrl+Tab=switch tabs\n");
@@ -2423,13 +2736,14 @@ if (wm_delete_window != None) {
 
             case ConfigureNotify:
                 break;
-                
+
             case ClientMessage:
                 // Handle window close
                 {
                     Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
-                    if (wm_delete_window != None && 
-                        event.xclient.data.l[0] == wm_delete_window) {
+                    if (wm_delete_window != None &&
+                        event.xclient.data.l[0] == wm_delete_window)
+                    {
                         printf("Window close requested - exiting\n");
                         goto cleanup;
                     }
@@ -2448,12 +2762,18 @@ if (wm_delete_window != None) {
                 Tab *active_tab = &tabs[active_tab_index];
                 if (active_tab->foreground_pid > 0)
                 {
-                    if (kill(active_tab->foreground_pid, SIGINT) == -1) {
-                        printf("Warning: Failed to send SIGINT to process %d: %s\n", 
+                    if (kill(active_tab->foreground_pid, SIGINT) == -1)
+                    {
+                        printf("Warning: Failed to send SIGINT to process %d: %s\n",
                                active_tab->foreground_pid, strerror(errno));
                     }
                     printf("Sent SIGINT to process %d\n", active_tab->foreground_pid);
                     active_tab->foreground_pid = -1;
+                }
+                if (multiwatch_mode)
+                {
+                    cleanup_multiwatch();
+                    multiwatch_mode = 0;
                 }
             }
             else if (which_signal == SIGTSTP)
@@ -2462,8 +2782,9 @@ if (wm_delete_window != None) {
                 Tab *active_tab = &tabs[active_tab_index];
                 if (active_tab->foreground_pid > 0)
                 {
-                    if (kill(active_tab->foreground_pid, SIGSTOP) == -1) {
-                        printf("Warning: Failed to send SIGSTOP to process %d: %s\n", 
+                    if (kill(active_tab->foreground_pid, SIGSTOP) == -1)
+                    {
+                        printf("Warning: Failed to send SIGSTOP to process %d: %s\n",
                                active_tab->foreground_pid, strerror(errno));
                     }
                     printf("Stopped process %d\n", active_tab->foreground_pid);
@@ -2478,23 +2799,6 @@ if (wm_delete_window != None) {
 
 cleanup:
     // Cleanup resources
-    XFreeGC(display, gc);
-    XDestroyWindow(display, window);
-    XCloseDisplay(display);
-    
+    cleanup_resources(display, window, gc);
     return 0;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
