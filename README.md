@@ -52,7 +52,7 @@ A feature-rich terminal emulator built with **X11** that supports multiple tabs,
 ## ⚙️ Compilation
 
 ```bash
-gcc -o myterm your_file.c -lX11 -Wall -Wextra
+gcc -o myterm x11_window.c -lX11 -Wall -Wextra
 ```
 
 ### Requirements
